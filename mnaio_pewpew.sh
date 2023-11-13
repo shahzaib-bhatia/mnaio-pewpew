@@ -16,6 +16,8 @@ reboot_and_rerun () {
   cat > /etc/systemd/system/mnaio_pewpew.service <<EOF
 [Service]
 ExecStart=$(realpath $0)
+Type=oneshot
+RemainAfterExit=yes
 [Install]
 WantedBy=default.target
 EOF
