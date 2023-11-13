@@ -42,7 +42,7 @@ if [[ ! -n ${TMUX} ]] ; then
   tmux new-session -s mnaio_pewpew -d
   tmux send-keys -t mnaio_pewpew C-c
   tmux send-keys -t mnaio_pewpew "bash $(realpath $0)" C-m
-  tmux attach -t mnaio_pewpew
+  if [[ -t 1 ]] ; then tmux attach -t mnaio_pewpew ; else echo "not a terminal"; fi
   exit 0
 else
   echo tmuxin
