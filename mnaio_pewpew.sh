@@ -6,8 +6,24 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 #### config ####
-DEVSTACK_BRANCH="stable/yoga"
-WANT_DISTRIB_CODENAME="focal"
+
+WANT_HOST_DISTRIB_CODENAME="jammy"
+GUEST_OS_IMAGE="http://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-amd64.img"
+
+STORAGE_DEVICES="/dev/sdc /dev/sdd"
+
+VM_CPUS=4
+VM_RAM="$(( 8 * 1024 ))"
+VM_DISK="20G"
+
+NUM_CONTROLLER=3
+NUM_COMPUTE=3
+NUM_NETWORK=3
+NUM_STORAGE=3
+
+NUM_STORAGE_VOLS=4
+SIZE_STORAGE_VOL="50G"
+
 
 #### helpers ####
 
@@ -28,6 +44,7 @@ EOF
 
 
 #### be nice ####
+
 if (systemctl -q is-enabled mnaio_pewpew.service 2>&-) ; then
   systemctl disable mnaio_pewpew.service
 fi
@@ -55,29 +72,15 @@ set -o pipefail
 
 #### get space ####
 
-#if [[ ! $(pvs /dev/sdc) ]] ; then
-#  pvcreate /dev/sdc
-#fi
-#if [[ ! $(pvs /dev/sdd) ]] ; then
-#  pvcreate /dev/sdd
-#fi
-#if [[ ! $(vgs vg_data) ]] ; then
-#  vgcreate vg_data /dev/sdc /dev/sdd
-#fi
-#if [[ ! $(lvs vg_data/lv_data 2>&-) ]] ; then
-#  lvcreate --type raid0 -l 25%FREE --nosync -n lv_data vg_data
-#fi
-#if [[ ! $(blkid /dev/vg_data/lv_data) ]] ; then
-#  mkfs.ext4 /dev/vg_data/lv_data
-#fi
-#
-#mkdir -p /data
-#
-#if [[ ! $(grep -q ^/dev/vg_data/lv_data /etc/fstab) ]] ; then
-#  echo '/dev/vg_data/lv_data /data auto defaults,,noatime,barrier=0 0 2' >> /etc/fstab
-#fi
-#
-#mount -a
+for STORAGE_DEVICE in ${STORAGE_DEVICES} ; do
+  if [[ ! $(pvs ${STORAGE_DEVICE}) ]] ; then
+    pvcreate ${STORAGE_DEVICE}
+  fi
+done
+
+if [[ ! $(vgs vg_libvirt) ]] ; then
+  vgcreate vg_libvirt ${STORAGE_DEVICES}
+fi
 
 #### update stuff ####
 
@@ -91,29 +94,237 @@ fi
 
 source /etc/lsb-release
 
-if [[ "${DISTRIB_CODENAME}" != "${WANT_DISTRIB_CODENAME}" ]] ; then
+if [[ "${DISTRIB_CODENAME}" != "${WANT_HOST_DISTRIB_CODENAME}" ]] ; then
   do-release-upgrade -m server -f DistUpgradeViewNonInteractive
   reboot_and_rerun
 fi
 
-apt -y install pwgen
+#### start work ####
 
-mkdir -p /opt/stack
-if [[ -d /opt/stack/devstack ]] ; then
-  rm -rvf /opt/stack/devstack
+if [[ ! -f "/root/.ssh/id_rsa" ]] ; then
+  ssh-keygen -f /root/.ssh/id_rsa -P ""
 fi
-git clone https://opendev.org/openstack/devstack /opt/stack/devstack
-bash /opt/stack/devstack/tools/create-stack-user.sh
-cd /opt/stack/devstack
-git checkout "${DEVSTACK_BRANCH}"
 
-cat > "/opt/stack/devstack/local.conf" <<EOF
-[[local|localrc]]
-ADMIN_PASSWORD=$(pwgen -s 31 1)
-DATABASE_PASSWORD=$(pwgen -s 31 1)
-RABBIT_PASSWORD=$(pwgen -s 31 1)
-SERVICE_PASSWORD=$(pwgen -s 31 1)
+apt -y install libvirt-daemon-system virtinst jq make python3-venv bridge-utils genisoimage pv
+
+
+if [[ ! -d "/opt/genestack" ]] ; then
+  git clone --recurse-submodules -j4 https://github.com/cloudnull/genestack /opt/genestack
+fi
+
+export LC_ALL=C.UTF-8
+mkdir -p ~/.venvs
+python3 -m venv ~/.venvs/kubespray
+~/.venvs/kubespray/bin/pip install pip  --upgrade
+source ~/.venvs/kubespray/bin/activate
+pip install -r /opt/genestack/submodules/kubespray/requirements.txt
+cd /opt/genestack/submodules/kubespray/inventory
+ln -sf /opt/genestack/openstack-flex .
+
+if ! which helm >&- ; then
+  curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+fi
+
+export CONTAINER_DISTRO_NAME=ubuntu
+export CONTAINER_DISTRO_VERSION=jammy
+export OPENSTACK_RELEASE=2023.1
+export OSH_DEPLOY_MULTINODE=True
+
+cd /opt/genestack/submodules/openstack-helm
+make all
+
+cd /opt/genestack/submodules/openstack-helm-infra
+make all
+
+#### make vms ####
+
+cd /tmp/
+if [[ ! -f /tmp/jammy-server-cloudimg-amd64.img ]] ; then
+  wget http://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img
+fi
+qemu-img convert jammy-server-cloudimg-amd64.img jammy-server-cloudimg-amd64.raw
+
+mkdir -p /var/lib/libvirt/qemu/console
+chown libvirt-qemu:kvm /var/lib/libvirt/qemu/console
+
+mkdir -p /var/lib/libvirt/qemu/cloud-init
+chown libvirt-qemu:kvm /var/lib/libvirt/qemu/cloud-init
+
+PREFIX="controller"
+for SEQ in $( seq 1 ${NUM_CONTROLLER} ) ; do
+  NAME="${PREFIX}${SEQ}"
+  mkdir -p "/var/lib/libvirt/qemu/cloud-init/${NAME}"
+  cd "/var/lib/libvirt/qemu/cloud-init/${NAME}"
+
+  cat <<EOF > meta-data
+instance-id: ${NAME}
+local-hostname: ${NAME}
 EOF
 
-chown -R stack:stack /opt/stack
-sudo -u stack /opt/stack/devstack/stack.sh
+  cat <<EOF > user-data
+#cloud-config
+
+users:
+  - name: ubuntu
+    ssh_authorized_keys:
+      - $(cat ~/.ssh/id_rsa.pub)
+    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
+    groups: sudo
+    shell: /bin/bash
+EOF
+
+  genisoimage -output cidata.iso -V cidata -r -J user-data meta-data
+
+  lvcreate --type raid0 -L "${VM_DISK}" --nosync -n "lv_${NAME}" vg_libvirt
+  pv /root/jammy-server-cloudimg-amd64.raw | dd bs=16M of="/dev/vg_libvirt/lv_${NAME}"
+
+  virt-install \
+    --name="${NAME}" \
+    --ram="${VM_RAM}" \
+    --vcpus="${VM_CPUS}" \
+    --import \
+    --disk path=/dev/vg_libvirt/lv_${NAME},bus=virtio,sparse=false,format=raw \
+    --disk path=/var/lib/libvirt/qemu/cloud-init/${NAME}/cidata.iso,device=cdrom \
+    --os-variant=ubuntu22.04 \
+    --network bridge=virbr0,model=virtio \
+    --graphics none \
+    --serial file,path=/var/lib/libvirt/qemu/console/${NAME}.log \
+    --noautoconsole
+done
+
+PREFIX="compute"
+for SEQ in $( seq 1 ${NUM_COMPUTE} ) ; do
+  NAME="${PREFIX}${SEQ}"
+  mkdir -p "/var/lib/libvirt/qemu/cloud-init/${NAME}"
+  cd "/var/lib/libvirt/qemu/cloud-init/${NAME}"
+
+  cat <<EOF > meta-data
+instance-id: ${NAME}
+local-hostname: ${NAME}
+EOF
+
+  cat <<EOF > user-data
+#cloud-config
+
+users:
+  - name: ubuntu
+    ssh_authorized_keys:
+      - $(cat ~/.ssh/id_rsa.pub)
+    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
+    groups: sudo
+    shell: /bin/bash
+EOF
+
+  genisoimage -output cidata.iso -V cidata -r -J user-data meta-data
+
+  lvcreate --type raid0 -L "${VM_DISK}" --nosync -n "lv_${NAME}" vg_libvirt
+  pv /root/jammy-server-cloudimg-amd64.raw | dd bs=16M of="/dev/vg_libvirt/lv_${NAME}"
+
+  virt-install \
+    --name="${NAME}" \
+    --ram="${VM_RAM}" \
+    --vcpus="${VM_CPUS}" \
+    --import \
+    --disk path=/dev/vg_libvirt/lv_${NAME},bus=virtio,sparse=false,format=raw \
+    --disk path=/var/lib/libvirt/qemu/cloud-init/${NAME}/cidata.iso,device=cdrom \
+    --os-variant=ubuntu22.04 \
+    --network bridge=virbr0,model=virtio \
+    --graphics none \
+    --serial file,path=/var/lib/libvirt/qemu/console/${NAME}.log \
+    --noautoconsole
+done
+
+PREFIX="network"
+for SEQ in $( seq 1 ${NUM_NETWORK} ) ; do
+  NAME="${PREFIX}${SEQ}"
+  mkdir -p "/var/lib/libvirt/qemu/cloud-init/${NAME}"
+  cd "/var/lib/libvirt/qemu/cloud-init/${NAME}"
+
+  cat <<EOF > meta-data
+instance-id: ${NAME}
+local-hostname: ${NAME}
+EOF
+
+  cat <<EOF > user-data
+#cloud-config
+
+users:
+  - name: ubuntu
+    ssh_authorized_keys:
+      - $(cat ~/.ssh/id_rsa.pub)
+    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
+    groups: sudo
+    shell: /bin/bash
+EOF
+
+  genisoimage -output cidata.iso -V cidata -r -J user-data meta-data
+
+  lvcreate --type raid0 -L "${VM_DISK}" --nosync -n "lv_${NAME}" vg_libvirt
+  pv /root/jammy-server-cloudimg-amd64.raw | dd bs=16M of="/dev/vg_libvirt/lv_${NAME}"
+
+  virt-install \
+    --name="${NAME}" \
+    --ram="${VM_RAM}" \
+    --vcpus="${VM_CPUS}" \
+    --import \
+    --disk path=/dev/vg_libvirt/lv_${NAME},bus=virtio,sparse=false,format=raw \
+    --disk path=/var/lib/libvirt/qemu/cloud-init/${NAME}/cidata.iso,device=cdrom \
+    --os-variant=ubuntu22.04 \
+    --network bridge=virbr0,model=virtio \
+    --graphics none \
+    --serial file,path=/var/lib/libvirt/qemu/console/${NAME}.log \
+    --noautoconsole
+done
+
+PREFIX="storage"
+for SEQ in $( seq 1 ${NUM_STORAGE} ) ; do
+  NAME="${PREFIX}${SEQ}"
+  mkdir -p "/var/lib/libvirt/qemu/cloud-init/${NAME}"
+  cd "/var/lib/libvirt/qemu/cloud-init/${NAME}"
+
+  cat <<EOF > meta-data
+instance-id: ${NAME}
+local-hostname: ${NAME}
+EOF
+
+  cat <<EOF > user-data
+#cloud-config
+
+users:
+  - name: ubuntu
+    ssh_authorized_keys:
+      - $(cat ~/.ssh/id_rsa.pub)
+    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
+    groups: sudo
+    shell: /bin/bash
+EOF
+
+  genisoimage -output cidata.iso -V cidata -r -J user-data meta-data
+
+  lvcreate --type raid0 -L "${VM_DISK}" --nosync -n "lv_${NAME}" vg_libvirt
+  pv /root/jammy-server-cloudimg-amd64.raw | dd bs=16M of="/dev/vg_libvirt/lv_${NAME}"
+
+  EXTRA_DISKS=""
+  for STORAGE_VOL in $( seq 1 ${NUM_STORAGE_VOLS} ) ; do
+    lvcreate --type raid0 -L "${SIZE_STORAGE_VOL}" --nosync -n "lv_${NAME}_${STORAGE_VOL}" vg_libvirt
+    EXTRA_DISKS="${EXTRA_DISKS} --disk path=/dev/vg_libvirt/lv_${NAME}_${STORAGE_VOL},bus=virtio,sparse=false,format=raw"
+  done
+
+  virt-install \
+    --name="${NAME}" \
+    --ram="${VM_RAM}" \
+    --vcpus="${VM_CPUS}" \
+    --import \
+    --disk path=/dev/vg_libvirt/lv_${NAME},bus=virtio,sparse=false,format=raw \
+    --disk path=/var/lib/libvirt/qemu/cloud-init/${NAME}/cidata.iso,device=cdrom \
+    ${EXTRA_DISKS} \
+    --os-variant=ubuntu22.04 \
+    --network bridge=virbr0,model=virtio \
+    --graphics none \
+    --serial file,path=/var/lib/libvirt/qemu/console/${NAME}.log \
+    --noautoconsole
+
+done
+
+
+#### TODO: generate an inventory file ####
