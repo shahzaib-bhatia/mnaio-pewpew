@@ -6,24 +6,48 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 #### config ####
-
 WANT_HOST_DISTRIB_CODENAME="jammy"
 GUEST_OS_IMAGE="http://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-amd64.img"
 
 STORAGE_DEVICES="/dev/sdc /dev/sdd"
 
-VM_CPUS=4
-VM_RAM="$(( 8 * 1024 ))"
-VM_DISK="20G"
+CLUSTER_NAME="lab.local"
 
-NUM_CONTROLLER=3
-NUM_COMPUTE=3
-NUM_NETWORK=3
-NUM_STORAGE=3
+VM_TYPES="utility controller compute network storage"
 
-NUM_STORAGE_VOLS=4
-SIZE_STORAGE_VOL="50G"
+declare -A NUM_VMS
+NUM_VMS["utility"]=1
+NUM_VMS["controller"]=3
+NUM_VMS["compute"]=4
+NUM_VMS["network"]=3
+NUM_VMS["storage"]=3
 
+declare -A VM_CPUS
+VM_CPUS["utility"]=2
+VM_CPUS["controller"]=4
+VM_CPUS["compute"]=6
+VM_CPUS["storage"]=2
+VM_CPUS["network"]=2
+
+declare -A VM_RAM
+VM_RAM["utility"]=4
+VM_RAM["controller"]=8
+VM_RAM["compute"]=8
+VM_RAM["storage"]=4
+VM_RAM["network"]=4
+
+declare -A VM_ROOT_DISK
+VM_ROOT_DISK["utility"]=20
+VM_ROOT_DISK["controller"]=20
+VM_ROOT_DISK["compute"]=20
+VM_ROOT_DISK["storage"]=20
+VM_ROOT_DISK["network"]=20
+
+declare -A VM_EXTRA_DISKS
+VM_EXTRA_DISKS["storage"]=4
+
+declare -A VM_EXTRA_DISKS_SIZE
+VM_EXTRA_DISKS_SIZE["storage"]="50G"
 
 #### helpers ####
 
@@ -70,6 +94,7 @@ fi
 set -euf
 set -o pipefail
 
+
 #### get space ####
 
 for STORAGE_DEVICE in ${STORAGE_DEVICES} ; do
@@ -81,6 +106,7 @@ done
 if [[ ! $(vgs vg_libvirt) ]] ; then
   vgcreate vg_libvirt ${STORAGE_DEVICES}
 fi
+
 
 #### update stuff ####
 
@@ -99,42 +125,14 @@ if [[ "${DISTRIB_CODENAME}" != "${WANT_HOST_DISTRIB_CODENAME}" ]] ; then
   reboot_and_rerun
 fi
 
-#### start work ####
+
+#### prereqs ####
 
 if [[ ! -f "/root/.ssh/id_rsa" ]] ; then
   ssh-keygen -f /root/.ssh/id_rsa -P ""
 fi
 
 apt -y install libvirt-daemon-system virtinst jq make python3-venv bridge-utils genisoimage pv
-
-
-if [[ ! -d "/opt/genestack" ]] ; then
-  git clone --recurse-submodules -j4 https://github.com/cloudnull/genestack /opt/genestack
-fi
-
-export LC_ALL=C.UTF-8
-mkdir -p ~/.venvs
-python3 -m venv ~/.venvs/kubespray
-~/.venvs/kubespray/bin/pip install pip  --upgrade
-source ~/.venvs/kubespray/bin/activate
-pip install -r /opt/genestack/submodules/kubespray/requirements.txt
-cd /opt/genestack/submodules/kubespray/inventory
-ln -sf /opt/genestack/openstack-flex .
-
-if ! which helm >&- ; then
-  curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-fi
-
-export CONTAINER_DISTRO_NAME=ubuntu
-export CONTAINER_DISTRO_VERSION=jammy
-export OPENSTACK_RELEASE=2023.1
-export OSH_DEPLOY_MULTINODE=True
-
-cd /opt/genestack/submodules/openstack-helm
-make all
-
-cd /opt/genestack/submodules/openstack-helm-infra
-make all
 
 #### make vms ####
 
@@ -150,181 +148,203 @@ chown libvirt-qemu:kvm /var/lib/libvirt/qemu/console
 mkdir -p /var/lib/libvirt/qemu/cloud-init
 chown libvirt-qemu:kvm /var/lib/libvirt/qemu/cloud-init
 
-PREFIX="controller"
-for SEQ in $( seq 1 ${NUM_CONTROLLER} ) ; do
-  NAME="${PREFIX}${SEQ}"
-  mkdir -p "/var/lib/libvirt/qemu/cloud-init/${NAME}"
-  cd "/var/lib/libvirt/qemu/cloud-init/${NAME}"
+for VM_TYPE in ${VM_TYPES} ; do
+  echo
+  for SEQ in $( seq 1 ${NUM_VMS[${VM_TYPE}]}) ; do
+    NAME="${VM_TYPE}${SEQ}"
+    FQDN="${NAME}.${CLUSTER_NAME}"
+    sed -i "/ ${FQDN}$/d" /etc/hosts
 
-  cat <<EOF > meta-data
+    echo "==> ${NAME} <=="
+    mkdir -p "/var/lib/libvirt/qemu/cloud-init/${NAME}"
+    cd "/var/lib/libvirt/qemu/cloud-init/${NAME}"
+
+    cat <<EOF > meta-data
 instance-id: ${NAME}
 local-hostname: ${NAME}
 EOF
 
-  cat <<EOF > user-data
+    cat <<EOF > user-data
 #cloud-config
 
 users:
   - name: ubuntu
     ssh_authorized_keys:
-      - $(cat ~/.ssh/id_rsa.pub)
-    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
+      - >-
+        $(cat /root/.ssh/id_rsa.pub)
+    sudo: 'ALL=(ALL) NOPASSWD:ALL'
     groups: sudo
     shell: /bin/bash
 EOF
 
-  genisoimage -output cidata.iso -V cidata -r -J user-data meta-data
+    genisoimage -quiet -output cidata.iso -V cidata -r -J user-data meta-data
 
-  lvcreate --type raid0 -L "${VM_DISK}" --nosync -n "lv_${NAME}" vg_libvirt
-  pv /root/jammy-server-cloudimg-amd64.raw | dd bs=16M of="/dev/vg_libvirt/lv_${NAME}"
+    EXTRA_DISKS=""
+    if [[ ! -z ${VM_EXTRA_DISKS[${VM_TYPE}]-} ]] ; then
+      for EXTRA_DISK in $( seq 1 ${VM_EXTRA_DISKS[${VM_TYPE}]} ) ; do
+        lvcreate --type raid0 -L "${VM_EXTRA_DISKS_SIZE[${VM_TYPE}]}G" --nosync -n "lv_${NAME}_${EXTRA_DISK}" vg_libvirt
+        EXTRA_DISKS="${EXTRA_DISKS} --disk path=/dev/vg_libvirt/lv_${NAME}_${EXTRA_DISK},bus=virtio,sparse=false,format=raw"
+      done
+    fi
 
-  virt-install \
-    --name="${NAME}" \
-    --ram="${VM_RAM}" \
-    --vcpus="${VM_CPUS}" \
-    --import \
-    --disk path=/dev/vg_libvirt/lv_${NAME},bus=virtio,sparse=false,format=raw \
-    --disk path=/var/lib/libvirt/qemu/cloud-init/${NAME}/cidata.iso,device=cdrom \
-    --os-variant=ubuntu22.04 \
-    --network bridge=virbr0,model=virtio \
-    --graphics none \
-    --serial file,path=/var/lib/libvirt/qemu/console/${NAME}.log \
-    --noautoconsole
-done
+    lvcreate --type raid0 -L "${VM_ROOT_DISK["${VM_TYPE}"]}G" --nosync -n "lv_${NAME}" vg_libvirt
+    dd if=/root/jammy-server-cloudimg-amd64.raw bs=16M of="/dev/vg_libvirt/lv_${NAME}" status=progress
 
-PREFIX="compute"
-for SEQ in $( seq 1 ${NUM_COMPUTE} ) ; do
-  NAME="${PREFIX}${SEQ}"
-  mkdir -p "/var/lib/libvirt/qemu/cloud-init/${NAME}"
-  cd "/var/lib/libvirt/qemu/cloud-init/${NAME}"
+    virt-install \
+      --name="${NAME}" \
+      --ram="$(( ${VM_RAM["${VM_TYPE}"]} * 1024 ))" \
+      --vcpus="${VM_CPUS["${VM_TYPE}"]}" \
+      --import \
+      --disk path=/dev/vg_libvirt/lv_${NAME},bus=virtio,sparse=false,format=raw \
+      --disk path=/var/lib/libvirt/qemu/cloud-init/${NAME}/cidata.iso,device=cdrom \
+      ${EXTRA_DISKS} \
+      --os-variant=ubuntu22.04 \
+      --network bridge=virbr0,model=virtio \
+      --graphics none \
+      --serial file,path=/var/lib/libvirt/qemu/console/${NAME}.log \
+      --noautoconsole
 
-  cat <<EOF > meta-data
-instance-id: ${NAME}
-local-hostname: ${NAME}
-EOF
-
-  cat <<EOF > user-data
-#cloud-config
-
-users:
-  - name: ubuntu
-    ssh_authorized_keys:
-      - $(cat ~/.ssh/id_rsa.pub)
-    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
-    groups: sudo
-    shell: /bin/bash
-EOF
-
-  genisoimage -output cidata.iso -V cidata -r -J user-data meta-data
-
-  lvcreate --type raid0 -L "${VM_DISK}" --nosync -n "lv_${NAME}" vg_libvirt
-  pv /root/jammy-server-cloudimg-amd64.raw | dd bs=16M of="/dev/vg_libvirt/lv_${NAME}"
-
-  virt-install \
-    --name="${NAME}" \
-    --ram="${VM_RAM}" \
-    --vcpus="${VM_CPUS}" \
-    --import \
-    --disk path=/dev/vg_libvirt/lv_${NAME},bus=virtio,sparse=false,format=raw \
-    --disk path=/var/lib/libvirt/qemu/cloud-init/${NAME}/cidata.iso,device=cdrom \
-    --os-variant=ubuntu22.04 \
-    --network bridge=virbr0,model=virtio \
-    --graphics none \
-    --serial file,path=/var/lib/libvirt/qemu/console/${NAME}.log \
-    --noautoconsole
-done
-
-PREFIX="network"
-for SEQ in $( seq 1 ${NUM_NETWORK} ) ; do
-  NAME="${PREFIX}${SEQ}"
-  mkdir -p "/var/lib/libvirt/qemu/cloud-init/${NAME}"
-  cd "/var/lib/libvirt/qemu/cloud-init/${NAME}"
-
-  cat <<EOF > meta-data
-instance-id: ${NAME}
-local-hostname: ${NAME}
-EOF
-
-  cat <<EOF > user-data
-#cloud-config
-
-users:
-  - name: ubuntu
-    ssh_authorized_keys:
-      - $(cat ~/.ssh/id_rsa.pub)
-    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
-    groups: sudo
-    shell: /bin/bash
-EOF
-
-  genisoimage -output cidata.iso -V cidata -r -J user-data meta-data
-
-  lvcreate --type raid0 -L "${VM_DISK}" --nosync -n "lv_${NAME}" vg_libvirt
-  pv /root/jammy-server-cloudimg-amd64.raw | dd bs=16M of="/dev/vg_libvirt/lv_${NAME}"
-
-  virt-install \
-    --name="${NAME}" \
-    --ram="${VM_RAM}" \
-    --vcpus="${VM_CPUS}" \
-    --import \
-    --disk path=/dev/vg_libvirt/lv_${NAME},bus=virtio,sparse=false,format=raw \
-    --disk path=/var/lib/libvirt/qemu/cloud-init/${NAME}/cidata.iso,device=cdrom \
-    --os-variant=ubuntu22.04 \
-    --network bridge=virbr0,model=virtio \
-    --graphics none \
-    --serial file,path=/var/lib/libvirt/qemu/console/${NAME}.log \
-    --noautoconsole
-done
-
-PREFIX="storage"
-for SEQ in $( seq 1 ${NUM_STORAGE} ) ; do
-  NAME="${PREFIX}${SEQ}"
-  mkdir -p "/var/lib/libvirt/qemu/cloud-init/${NAME}"
-  cd "/var/lib/libvirt/qemu/cloud-init/${NAME}"
-
-  cat <<EOF > meta-data
-instance-id: ${NAME}
-local-hostname: ${NAME}
-EOF
-
-  cat <<EOF > user-data
-#cloud-config
-
-users:
-  - name: ubuntu
-    ssh_authorized_keys:
-      - $(cat ~/.ssh/id_rsa.pub)
-    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
-    groups: sudo
-    shell: /bin/bash
-EOF
-
-  genisoimage -output cidata.iso -V cidata -r -J user-data meta-data
-
-  lvcreate --type raid0 -L "${VM_DISK}" --nosync -n "lv_${NAME}" vg_libvirt
-  pv /root/jammy-server-cloudimg-amd64.raw | dd bs=16M of="/dev/vg_libvirt/lv_${NAME}"
-
-  EXTRA_DISKS=""
-  for STORAGE_VOL in $( seq 1 ${NUM_STORAGE_VOLS} ) ; do
-    lvcreate --type raid0 -L "${SIZE_STORAGE_VOL}" --nosync -n "lv_${NAME}_${STORAGE_VOL}" vg_libvirt
-    EXTRA_DISKS="${EXTRA_DISKS} --disk path=/dev/vg_libvirt/lv_${NAME}_${STORAGE_VOL},bus=virtio,sparse=false,format=raw"
   done
+done
 
-  virt-install \
-    --name="${NAME}" \
-    --ram="${VM_RAM}" \
-    --vcpus="${VM_CPUS}" \
-    --import \
-    --disk path=/dev/vg_libvirt/lv_${NAME},bus=virtio,sparse=false,format=raw \
-    --disk path=/var/lib/libvirt/qemu/cloud-init/${NAME}/cidata.iso,device=cdrom \
-    ${EXTRA_DISKS} \
-    --os-variant=ubuntu22.04 \
-    --network bridge=virbr0,model=virtio \
-    --graphics none \
-    --serial file,path=/var/lib/libvirt/qemu/console/${NAME}.log \
-    --noautoconsole
-
+echo "waiting for vms to boot..."
+for VM_TYPE in ${VM_TYPES} ; do
+  for SEQ in $( seq 1 ${NUM_VMS[${VM_TYPE}]}) ; do
+    NAME="${VM_TYPE}${SEQ}"
+    FQDN="${NAME}.${CLUSTER_NAME}"
+    echo "Checking ${FQDN} ..."
+    until grep -q "${NAME} login:" /var/lib/libvirt/qemu/console/${NAME}.log ; do
+      echo "Still waiting for ${FQDN} to boot..."
+      sleep 2
+    done
+    echo "${FQDN} OK"
+  done
 done
 
 
-#### TODO: generate an inventory file ####
+#### make inventory ####
+
+INVENTORY=$(mktemp)
+
+echo "[all]" > ${INVENTORY}
+
+for VM_TYPE in ${VM_TYPES} ; do
+  for SEQ in $( seq 1 ${NUM_VMS[${VM_TYPE}]}) ; do
+    NAME="${VM_TYPE}${SEQ}"
+    FQDN="${NAME}.${CLUSTER_NAME}"
+    echo "Adding ${FQDN} to inventory"
+    IP="$(virsh net-dhcp-leases default | grep ${NAME} | awk '{print $5}' | cut -d'/' -f1)"
+    echo "${FQDN} ansible_host=${IP} ip=${IP} ansible_user=ubuntu ansible_become=true" >> ${INVENTORY}
+    echo "${IP} ${NAME} ${FQDN}" >> /etc/hosts
+    #ssh -o StrictHostKeyChecking=accept-new ubuntu@${FQDN} sudo hostnamectl set-hostname ${FQDN}
+  done
+done
+
+cat <<EOF >> ${INVENTORY}
+[all:vars]
+ansible_ssh_common_args='-o StrictHostKeyChecking=accept-new'
+cluster_name=${CLUSTER_NAME}
+download_run_once=True
+#kube_ovn_iface=ens4
+#kube_ovn_default_interface_name=ens3
+EOF
+
+echo "[bastion]" >> ${INVENTORY}
+WANT_TYPES="none"
+for VM_TYPE in ${WANT_TYPES} ; do
+  if [[ ! -z ${NUM_VMS[${VM_TYPE}]-} ]] ; then
+    for SEQ in $( seq 1 ${NUM_VMS[${VM_TYPE}]}) ; do
+      NAME="${VM_TYPE}${SEQ}"
+      FQDN="${NAME}.${CLUSTER_NAME}"
+      echo "${FQDN}" >> ${INVENTORY}
+    done
+  fi
+done
+
+echo "[kube_control_plane]" >> ${INVENTORY}
+WANT_TYPES="controller"
+for VM_TYPE in ${WANT_TYPES} ; do
+  if [[ ! -z ${NUM_VMS[${VM_TYPE}]-} ]] ; then
+    for SEQ in $( seq 1 ${NUM_VMS[${VM_TYPE}]}) ; do
+      NAME="${VM_TYPE}${SEQ}"
+      FQDN="${NAME}.${CLUSTER_NAME}"
+      echo "${FQDN}" >> ${INVENTORY}
+    done
+  fi
+done
+
+echo "[etcd]" >> ${INVENTORY}
+WANT_TYPES="controller"
+for VM_TYPE in ${WANT_TYPES} ; do
+  if [[ ! -z ${NUM_VMS[${VM_TYPE}]-} ]] ; then
+    for SEQ in $( seq 1 ${NUM_VMS[${VM_TYPE}]}) ; do
+      NAME="${VM_TYPE}${SEQ}"
+      FQDN="${NAME}.${CLUSTER_NAME}"
+      echo "${FQDN}" >> ${INVENTORY}
+    done
+  fi
+done
+
+echo "[kube_node]" >> ${INVENTORY}
+WANT_TYPES="compute network storage"
+for VM_TYPE in ${WANT_TYPES} ; do
+  if [[ ! -z ${NUM_VMS[${VM_TYPE}]-} ]] ; then
+    for SEQ in $( seq 1 ${NUM_VMS[${VM_TYPE}]}) ; do
+      NAME="${VM_TYPE}${SEQ}"
+      FQDN="${NAME}.${CLUSTER_NAME}"
+      echo "${FQDN}" >> ${INVENTORY}
+    done
+  fi
+done
+
+cat <<EOF >> ${INVENTORY}
+[k8s_cluster:children]
+kube_control_plane
+kube_node
+EOF
+
+
+
+
+if [[ ! -d "/opt/genestack" ]] ; then
+  git clone --recurse-submodules -j4 https://github.com/cloudnull/genestack /opt/genestack
+fi
+
+export LC_ALL=C.UTF-8
+mkdir -p ~/.venvs
+python3 -m venv ~/.venvs/kubespray
+~/.venvs/kubespray/bin/pip install pip  --upgrade
+source ~/.venvs/kubespray/bin/activate
+pip install -r /opt/genestack/submodules/kubespray/requirements.txt
+cd /opt/genestack/submodules/kubespray/inventory
+ln -sf /opt/genestack/openstack-flex .
+
+#### copy inventory ####
+
+cp ${INVENTORY} /opt/genestack/inventory.ini
+cp ${INVENTORY} /opt/genestack/openstack-flex/inventory.ini
+cp ${INVENTORY} /opt/genestack/submodules/kubespray/inventory/inventory.ini
+rm ${INVENTORY}
+INVENTORY=/opt/genestack/openstack-flex/inventory.ini
+
+if [[ -z "$(which helm)" ]] ; then
+  curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+fi
+
+export CONTAINER_DISTRO_NAME=ubuntu
+export CONTAINER_DISTRO_VERSION=jammy
+export OPENSTACK_RELEASE=2023.1
+export OSH_DEPLOY_MULTINODE=True
+
+cd /opt/genestack/submodules/openstack-helm
+make all
+
+cd /opt/genestack/submodules/openstack-helm-infra
+make all
+
+cd /opt/genestack/submodules/kubespray
+ansible -m wait_for -a 'port=22 timeout=300' -i ${INVENTORY} all
+ansible -m shell -a 'hostnamectl set-hostname {{ inventory_hostname }}' -i ${INVENTORY} all
+ansible -m setup -i ${INVENTORY} all
+
+ansible-playbook -v --inventory ${INVENTORY} cluster.yml
