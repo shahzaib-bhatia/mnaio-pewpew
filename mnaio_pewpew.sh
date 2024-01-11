@@ -6,6 +6,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 #### config ####
+
 WANT_HOST_DISTRIB_CODENAME="jammy"
 GUEST_OS_IMAGE="http://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-amd64.img"
 
@@ -47,7 +48,15 @@ declare -A VM_EXTRA_DISKS
 VM_EXTRA_DISKS["storage"]=4
 
 declare -A VM_EXTRA_DISKS_SIZE
-VM_EXTRA_DISKS_SIZE["storage"]="50G"
+VM_EXTRA_DISKS_SIZE["storage"]="50"
+
+# Eventually we'll do public/private bridges but for now...
+LIBVIRT_PUBLIC_BRIDGE_NAME="default"
+LIBVIRT_PUBLIC_BRIDGE_DEVICE="virbr0"
+LIBVIRT_PRIVATE_BRIDGE_NAME=""
+LIBVIRT_PRIVATE_BRIDGE_DEVICE=""
+
+SLEEP_BETWEEN_VMS=0
 
 #### helpers ####
 
@@ -204,6 +213,7 @@ EOF
       --serial file,path=/var/lib/libvirt/qemu/console/${NAME}.log \
       --noautoconsole
 
+    sleep ${SLEEP_BETWEEN_VMS}
   done
 done
 
@@ -233,10 +243,11 @@ for VM_TYPE in ${VM_TYPES} ; do
     NAME="${VM_TYPE}${SEQ}"
     FQDN="${NAME}.${CLUSTER_NAME}"
     echo "Adding ${FQDN} to inventory"
-    IP="$(virsh net-dhcp-leases default | grep ${NAME} | awk '{print $5}' | cut -d'/' -f1)"
+    # taking the long way around because sometimes dnsmasq gets confused about names
+    #IP="$(virsh net-dhcp-leases default | grep ${NAME} | awk '{print $5}' | cut -d'/' -f1)"
+    IP="$(virsh net-dhcp-leases default | grep $(virsh domiflist ${NAME} | awk "/virbr0/ {print \$5}") | awk '{print $5}' | cut -d'/' -f1)"
     echo "${FQDN} ansible_host=${IP} ip=${IP} ansible_user=ubuntu ansible_become=true" >> ${INVENTORY}
     echo "${IP} ${NAME} ${FQDN}" >> /etc/hosts
-    #ssh -o StrictHostKeyChecking=accept-new ubuntu@${FQDN} sudo hostnamectl set-hostname ${FQDN}
   done
 done
 
@@ -250,7 +261,7 @@ download_run_once=True
 EOF
 
 echo "[bastion]" >> ${INVENTORY}
-WANT_TYPES="none"
+WANT_TYPES="bastion"
 for VM_TYPE in ${WANT_TYPES} ; do
   if [[ ! -z ${NUM_VMS[${VM_TYPE}]-} ]] ; then
     for SEQ in $( seq 1 ${NUM_VMS[${VM_TYPE}]}) ; do
@@ -304,7 +315,7 @@ kube_node
 EOF
 
 
-
+#### get the helm stuff ####
 
 if [[ ! -d "/opt/genestack" ]] ; then
   git clone --recurse-submodules -j4 https://github.com/cloudnull/genestack /opt/genestack
@@ -318,6 +329,7 @@ source ~/.venvs/kubespray/bin/activate
 pip install -r /opt/genestack/submodules/kubespray/requirements.txt
 cd /opt/genestack/submodules/kubespray/inventory
 ln -sf /opt/genestack/openstack-flex .
+
 
 #### copy inventory ####
 
@@ -343,8 +355,61 @@ cd /opt/genestack/submodules/openstack-helm-infra
 make all
 
 cd /opt/genestack/submodules/kubespray
-ansible -m wait_for -a 'port=22 timeout=300' -i ${INVENTORY} all
+#ansible -m wait_for -a 'port=22 timeout=300' -i ${INVENTORY} all
+# set fqdn to make kube happy
 ansible -m shell -a 'hostnamectl set-hostname {{ inventory_hostname }}' -i ${INVENTORY} all
+# force facts (on dirty systems old facts can confuse ansible)
 ansible -m setup -i ${INVENTORY} all
 
-ansible-playbook -v --inventory ${INVENTORY} cluster.yml
+ansible-playbook -i ${INVENTORY} cluster.yml
+
+
+#### steal the cluster tools and secrets so we can run them from here ####
+
+mkdir -p /root/.kube
+chmod 0700 /root/.kube
+ansible 'kube_control_plane[0]' -i ${INVENTORY} -m fetch -a 'src=/usr/local/bin/kubectl dest=/usr/local/bin/kubectl flat=true'
+ansible 'kube_control_plane[0]' -i ${INVENTORY} -m fetch -a 'src=/root/.kube/config dest=/root/.kube/config flat=true'
+chmod +x /usr/local/bin/kubectl
+chmod 0600 /root/.kube/config
+sed -i "s/127\.0\.0\.1/controller1.${CLUSTER_NAME}/" /root/.kube/config
+
+cd ~
+kubectl get nodes -o wide
+
+
+#### start configuring for openstack ####
+
+kubectl taint nodes $(kubectl get nodes -l node-role.kubernetes.io/control-plane -o 'jsonpath={.items[*].metadata.name}' ) node-role.kubernetes.io/control-plane:NoSchedule-
+
+# Label the storage nodes - optional and only used when deploying ceph for K8S infrastructure shared storage
+kubectl label node $(kubectl get nodes | awk '/ceph/ {print $1}') role=storage-node
+
+# Label the openstack controllers
+kubectl label node $(kubectl get nodes -l 'node-role.kubernetes.io/control-plane' -o 'jsonpath={.items[*].metadata.name}') openstack-control-plane=enabled
+
+# Label the openstack compute nodes
+kubectl label node $(kubectl get nodes | awk '/compute/ {print $1}') openstack-compute-node=enabled
+
+# Label the openstack network nodes
+kubectl label node $(kubectl get nodes | awk '/network/ {print $1}') openstack-network-node=enabled
+
+# Label the openstack storage nodes
+kubectl label node $(kubectl get nodes | awk '/storage/ {print $1}') openstack-storage-node=enabled
+
+# With OVN we need the compute nodes to be "network" nodes as well. While they will be configured for networking, they wont be gateways.
+kubectl label node $(kubectl get nodes | awk '/compute/ {print $1}') openstack-network-node=enabled
+
+# Label all workers - Recommended and used when deploying Kubernetes specific services
+kubectl label node $(kubectl get nodes -l 'node-role.kubernetes.io/control-plane' -o 'jsonpath={.items[*].metadata.name}') node-role.kubernetes.io/worker=worker
+
+kubectl get nodes -o wide
+
+
+#### we're kubin now, do the ceph thing ####
+
+kubectl apply -k /opt/genestack/kustomize/rook-operator/
+kubectl apply -k /opt/genestack/kustomize/rook-cluster/
+
+# todo: wait for this to be ready
+kubectl --namespace rook-ceph get cephclusters.ceph.rook.io
