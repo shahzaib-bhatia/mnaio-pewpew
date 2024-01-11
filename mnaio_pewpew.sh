@@ -141,7 +141,7 @@ if [[ ! -f "/root/.ssh/id_rsa" ]] ; then
   ssh-keygen -f /root/.ssh/id_rsa -P ""
 fi
 
-apt -y install libvirt-daemon-system virtinst jq make python3-venv bridge-utils genisoimage pv
+apt -y install libvirt-daemon-system virtinst jq make python3-venv bridge-utils genisoimage pv pwgen
 
 #### make vms ####
 
@@ -383,7 +383,7 @@ kubectl get nodes -o wide
 kubectl taint nodes $(kubectl get nodes -l node-role.kubernetes.io/control-plane -o 'jsonpath={.items[*].metadata.name}' ) node-role.kubernetes.io/control-plane:NoSchedule-
 
 # Label the storage nodes - optional and only used when deploying ceph for K8S infrastructure shared storage
-kubectl label node $(kubectl get nodes | awk '/ceph/ {print $1}') role=storage-node
+kubectl label node $(kubectl get nodes | awk '/storage|ceph/ {print $1}') role=storage-node
 
 # Label the openstack controllers
 kubectl label node $(kubectl get nodes -l 'node-role.kubernetes.io/control-plane' -o 'jsonpath={.items[*].metadata.name}') openstack-control-plane=enabled
@@ -408,8 +408,41 @@ kubectl get nodes -o wide
 
 #### we're kubin now, do the ceph thing ####
 
-kubectl apply -k /opt/genestack/kustomize/rook-operator/
-kubectl apply -k /opt/genestack/kustomize/rook-cluster/
+kubectl apply -k /opt/genestack/kustomize/rook-operator/ --wait
 
-# todo: wait for this to be ready
-kubectl --namespace rook-ceph get cephclusters.ceph.rook.io
+echo "waiting for v1.ceph.rook.io ..."
+until kubectl get apiservice v1.ceph.rook.io ; do echo "still waiting for apiservice v1.ceph.rook.io ..." ; sleep 1 ; done
+kubectl wait apiservice v1.ceph.rook.io --for=jsonpath='.status.conditions[0].status'=True --timeout=60s
+
+echo "waiting for v1alpha1.objectbucket.io..."
+until kubectl get apiservice v1alpha1.objectbucket.io ; do echo "still waiting for v1alpha1.objectbucket.io ..." ; sleep 1 ; done
+kubectl wait apiservice v1alpha1.objectbucket.io --for=jsonpath='.status.conditions[0].status'=True --timeout=60s
+
+kubectl apply -k /opt/genestack/kustomize/rook-cluster/  --wait
+
+echo "making a ceph"
+until kubectl -n rook-ceph get cephclusters.ceph.rook.io rook-ceph ; do echo "waiting for kube to catch up..." ; sleep 1 ; done
+until kubectl -n rook-ceph wait cephclusters.ceph.rook.io rook-ceph --for=jsonpath='.status.phase="Ready"' --timeout 30s ; do
+  echo "ceph cluster still cooking, please enjoy some logs while we wait..."
+  kubectl -n rook-ceph get cephclusters.ceph.rook.io rook-ceph
+  kubectl -n rook-ceph logs deploy/rook-ceph-operator --tail=10
+  sleep 1
+done
+
+kubectl -n rook-ceph get cephclusters.ceph.rook.io rook-ceph
+
+kubectl apply -k /opt/genestack/kustomize/rook-defaults
+
+kubectl apply -k /opt/genestack/kustomize/openstack
+
+kubectl --namespace openstack \
+        create secret generic mariadb \
+        --type Opaque \
+        --from-literal=root-password="$(pwgen -s 32 1)" \
+        --from-literal=password="$(pwgen -s 32 1)"
+
+kubectl kustomize --enable-helm /opt/genestack/kustomize/mariadb-operator | kubectl --namespace mariadb-system apply --server-side --force-conflicts -f -
+
+kubectl --namespace openstack apply -k /opt/genestack/kustomize/mariadb-cluster/base
+
+kubectl -n openstack get mariadb mariadb-galera
