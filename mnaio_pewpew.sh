@@ -56,7 +56,33 @@ LIBVIRT_PUBLIC_BRIDGE_DEVICE="virbr0"
 LIBVIRT_PRIVATE_BRIDGE_NAME=""
 LIBVIRT_PRIVATE_BRIDGE_DEVICE=""
 
-SLEEP_BETWEEN_VMS=0
+# Still in progress.
+# Doing /24s because 200 vms ought to be enough for anybody...
+# and it means we can lazily just string assemble the addrs
+MGMT_BRIDGE="br-mgmt"
+MGMT_IP_PREFIX="192.168.100"
+MGMT_MAC_PREFIX="de:ad:be:ef:00"
+
+KUBE_BRIDGE="br-kube"
+KUBE_IP_PREFIX="192.168.120"
+KUBE_MAC_PREFIX="de:ad:be:ef:11"
+
+BREX_BRIDGE="br-ex"
+# br-ex IPs go to neutron not the vms but we still need the space reserved
+BREX_IP_PREFIX="192.168.140"
+BREX_MAC_PREFIX="de:ad:be:ef:22"
+
+IPTABLES_V4_CONF="/etc/iptables/rules.v4"
+IPTABLES_V6_CONF="/etc/iptables/rules.v6"
+
+# these get filled in later
+LIST_OF_VMS=""
+declare -A VM_IP_MGMT
+declare -A VM_MAC_MGMT
+declare -A VM_IP_KUBE
+declare -A VM_MAC_KUBE
+declare -A VM_IP_BREX
+declare -A VM_MAC_BREX
 
 #### helpers ####
 
@@ -75,6 +101,37 @@ EOF
   reboot
 }
 
+wait_for_a_kube_thing () {
+  NAMESPACE=$1
+  OBJECT_TYPE=$2
+  OBJECT_NAME=$3
+  CONDITION_PATH=${4:-}
+  CONDITION_WANT=${5:-True}
+
+  # wait for object to exist
+  until kubectl -n ${NAMESPACE} get ${OBJECT_TYPE} ${OBJECT_NAME} ; do sleep 1 ; done
+
+  # print condition
+  kubectl -n ${NAMESPACE} get ${OBJECT_TYPE} ${OBJECT_NAME} -o json | jq -c '.status'
+
+  # wait for condition to be met
+  if [[ ! -z ${CONDITION_PATH} ]] ; then
+    # The sane thing would be to do "kubectl wait" but it can't filter for objects in an array until 1.31 and this initially targets 1.26
+    # ref: https://github.com/kubernetes/kubernetes/pull/118748
+    # And the whole reason we're in this function is "kubectl wait" can't wait for a thing that doesn't exist yet so we might as well keep at it
+    # until kubectl -n ${NAMESPACE} wait ${OBJECT_TYPE} ${OBJECT_NAME} --for=jsonpath="${CONDITION_PATH}"=${CONDITION_WANT} --timeout 10s ; do
+    until [[ "$(kubectl -n ${NAMESPACE} get ${OBJECT_TYPE} ${OBJECT_NAME} -o json | jq -r "${CONDITION_PATH}")" == "${CONDITION_WANT}" ]] ; do
+      echo "Still waiting for ${NAMESPACE} ${OBJECT_TYPE} ${OBJECT_NAME}..."
+      echo "  ${OBJECT_NAME} ${CONDITION_PATH} = $(kubectl -n ${NAMESPACE} get ${OBJECT_TYPE} ${OBJECT_NAME} -o json | jq -r "${CONDITION_PATH}") want ${CONDITION_WANT}"
+      kubectl -n ${NAMESPACE} get ${OBJECT_TYPE} ${OBJECT_NAME}
+      sleep 1
+    done
+  kubectl -n ${NAMESPACE} get ${OBJECT_TYPE} ${OBJECT_NAME} -o json | jq -c '.status'
+  fi
+
+  echo "Finished waiting for ${NAMESPACE} ${OBJECT_TYPE} ${OBJECT_NAME}"
+
+}
 
 #### be nice ####
 
@@ -141,7 +198,143 @@ if [[ ! -f "/root/.ssh/id_rsa" ]] ; then
   ssh-keygen -f /root/.ssh/id_rsa -P ""
 fi
 
-apt -y install libvirt-daemon-system virtinst jq make python3-venv bridge-utils genisoimage pv pwgen
+DEBIAN_FRONTEND=noninteractive apt-get -y install libvirt-daemon-system virtinst jq make python3-venv bridge-utils genisoimage pv pwgen iptables-persistent
+
+
+#### networking ####
+
+# MGMT_BRIDGE="br-mgmt"
+# MGMT_IP_PREFIX="192.168.100"
+# KUBE...
+# BREX...
+
+HOST_MGMT_IP="${MGMT_IP_PREFIX}.1"
+HOST_KUBE_IP="${KUBE_IP_PREFIX}.1"
+HOST_BREX_IP="${BREX_IP_PREFIX}.1"
+
+MGMT_NET="${MGMT_IP_PREFIX}.0/24"
+KUBE_NET="${KUBE_IP_PREFIX}.0/24"
+BREX_NET="${BREX_IP_PREFIX}.0/24"
+
+if ip link show dev ${MGMT_BRIDGE} 2>&- ; then ip link set ${MGMT_BRIDGE} down && brctl delbr ${MGMT_BRIDGE} ; fi
+if ip link show dev ${KUBE_BRIDGE} 2>&- ; then ip link set ${KUBE_BRIDGE} down && brctl delbr ${KUBE_BRIDGE} ; fi
+if ip link show dev ${BREX_BRIDGE} 2>&- ; then ip link set ${BREX_BRIDGE} down && brctl delbr ${BREX_BRIDGE} ; fi
+
+brctl addbr ${MGMT_BRIDGE}
+brctl addbr ${KUBE_BRIDGE}
+brctl addbr ${BREX_BRIDGE}
+
+ip addr add ${HOST_MGMT_IP}/24 dev ${MGMT_BRIDGE}
+ip addr add ${HOST_KUBE_IP}/24 dev ${KUBE_BRIDGE}
+ip addr add ${HOST_BREX_IP}/24 dev ${BREX_BRIDGE}
+
+ip link set ${MGMT_BRIDGE} up
+ip link set ${KUBE_BRIDGE} up
+ip link set ${BREX_BRIDGE} up
+
+cat <<EOF > ${IPTABLES_V4_CONF}
+*mangle
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+COMMIT
+
+*filter
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:AIO_FWI - [0:0]
+:AIO_FWO - [0:0]
+:AIO_FWX - [0:0]
+:AIO_INP - [0:0]
+:AIO_OUT - [0:0]
+-A INPUT -i ${MGMT_BRIDGE} -j AIO_INP
+-A INPUT -i ${KUBE_BRIDGE} -j AIO_INP
+-A INPUT -i ${BREX_BRIDGE} -j AIO_INP
+-A FORWARD -i ${MGMT_BRIDGE} -o ${MGMT_BRIDGE} -j AIO_FWX
+-A FORWARD -i ${KUBE_BRIDGE} -o ${KUBE_BRIDGE} -j AIO_FWX
+-A FORWARD -i ${BREX_BRIDGE} -o ${BREX_BRIDGE} -j AIO_FWX
+-A FORWARD -o ${MGMT_BRIDGE} -j AIO_FWI
+-A FORWARD -o ${KUBE_BRIDGE} -j AIO_FWI
+-A FORWARD -o ${BREX_BRIDGE} -j AIO_FWI
+-A FORWARD -i ${MGMT_BRIDGE} -j AIO_FWO
+-A FORWARD -i ${KUBE_BRIDGE} -j AIO_FWO
+-A FORWARD -i ${BREX_BRIDGE} -j AIO_FWO
+-A OUTPUT  -o ${MGMT_BRIDGE} -j AIO_OUT
+-A OUTPUT  -o ${KUBE_BRIDGE} -j AIO_OUT
+-A OUTPUT  -o ${BREX_BRIDGE} -j AIO_OUT
+-A AIO_FWI -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A AIO_FWI -j REJECT --reject-with icmp-port-unreachable
+-A AIO_FWO -i ${MGMT_BRIDGE} -s ${MGMT_NET} -j ACCEPT
+-A AIO_FWO -i ${KUBE_BRIDGE} -s ${KUBE_NET} -j REJECT --reject-with icmp-port-unreachable
+-A AIO_FWO -i ${BREX_BRIDGE} -s ${BREX_NET} -j ACCEPT
+-A AIO_FWO -j REJECT --reject-with icmp-port-unreachable
+-A AIO_FWX -j ACCEPT
+-A AIO_INP -p udp -m udp --dport 53 -j ACCEPT
+-A AIO_INP -p tcp -m tcp --dport 53 -j ACCEPT
+-A AIO_INP -p udp -m udp --dport 67 -j ACCEPT
+-A AIO_INP -p tcp -m tcp --dport 67 -j ACCEPT
+-A AIO_OUT -p udp -m udp --dport 53 -j ACCEPT
+-A AIO_OUT -p tcp -m tcp --dport 53 -j ACCEPT
+-A AIO_OUT -p udp -m udp --dport 68 -j ACCEPT
+-A AIO_OUT -p tcp -m tcp --dport 68 -j ACCEPT
+COMMIT
+
+*nat
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+:AIO_PRT - [0:0]
+-A POSTROUTING -j AIO_PRT
+-A AIO_PRT -s ${MGMT_NET} -d 224.0.0.0/24 -j RETURN
+-A AIO_PRT -s ${KUBE_NET} -d 224.0.0.0/24 -j RETURN
+-A AIO_PRT -s ${BREX_NET} -d 224.0.0.0/24 -j RETURN
+-A AIO_PRT -s ${MGMT_NET} -d 255.255.255.255/32 -j RETURN
+-A AIO_PRT -s ${KUBE_NET} -d 255.255.255.255/32 -j RETURN
+-A AIO_PRT -s ${BREX_NET} -d 255.255.255.255/32 -j RETURN
+-A AIO_PRT -s ${MGMT_NET} ! -d ${MGMT_NET} -p tcp -j MASQUERADE --to-ports 1024-65535
+-A AIO_PRT -s ${KUBE_NET} ! -d ${KUBE_NET} -p tcp -j MASQUERADE --to-ports 1024-65535
+-A AIO_PRT -s ${BREX_NET} ! -d ${BREX_NET} -p tcp -j MASQUERADE --to-ports 1024-65535
+-A AIO_PRT -s ${MGMT_NET} ! -d ${MGMT_NET} -p udp -j MASQUERADE --to-ports 1024-65535
+-A AIO_PRT -s ${KUBE_NET} ! -d ${KUBE_NET} -p udp -j MASQUERADE --to-ports 1024-65535
+-A AIO_PRT -s ${BREX_NET} ! -d ${BREX_NET} -p udp -j MASQUERADE --to-ports 1024-65535
+-A AIO_PRT -s ${MGMT_NET} ! -d ${MGMT_NET} -j MASQUERADE
+-A AIO_PRT -s ${KUBE_NET} ! -d ${KUBE_NET} -j MASQUERADE
+-A AIO_PRT -s ${BREX_NET} ! -d ${BREX_NET} -j MASQUERADE
+COMMIT
+EOF
+
+cat <<EOF > ${IPTABLES_V6_CONF}
+*mangle
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+COMMIT
+
+*filter
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -i ${MGMT_BRIDGE} -j REJECT --reject-with icmp6-adm-prohibited
+-A INPUT -i ${KUBE_BRIDGE} -j REJECT --reject-with icmp6-adm-prohibited
+-A INPUT -i ${BREX_BRIDGE} -j REJECT --reject-with icmp6-adm-prohibited
+COMMIT
+
+*nat
+:PREROUTING DROP [0:0]
+:INPUT DROP [0:0]
+:OUTPUT DROP [0:0]
+:POSTROUTING DROP [0:0]
+COMMIT
+EOF
+
+iptables-restore -v < ${IPTABLES_V4_CONF}
+ip6tables-restore -v < ${IPTABLES_V6_CONF}
 
 #### make vms ####
 
@@ -158,13 +351,24 @@ mkdir -p /var/lib/libvirt/qemu/cloud-init
 chown libvirt-qemu:kvm /var/lib/libvirt/qemu/cloud-init
 
 for VM_TYPE in ${VM_TYPES} ; do
-  echo
   for SEQ in $( seq 1 ${NUM_VMS[${VM_TYPE}]}) ; do
     NAME="${VM_TYPE}${SEQ}"
     FQDN="${NAME}.${CLUSTER_NAME}"
     sed -i "/ ${FQDN}$/d" /etc/hosts
 
     echo "==> ${NAME} <=="
+
+    LIST_OF_VMS="${LIST_OF_VMS}${NAME} "
+    # Get a (global) sequence number starting at 10
+    NUM=$(( 9 + $(wc -w <<< ${LIST_OF_VMS} ) ))
+    HEX_NUM="$(printf %02x ${NUM})"
+    VM_IP_MGMT["${NAME}"]="${MGMT_IP_PREFIX}.${NUM}"
+    VM_MAC_MGMT[${NAME}]="${MGMT_MAC_PREFIX}:${HEX_NUM}"
+    VM_IP_KUBE[${NAME}]="${KUBE_IP_PREFIX}.${NUM}"
+    VM_MAC_KUBE[${NAME}]="${KUBE_MAC_PREFIX}:${HEX_NUM}"
+    VM_IP_BREX[${NAME}]="${BREX_IP_PREFIX}.${NUM}"
+    VM_MAC_BREX[${NAME}]="${BREX_MAC_PREFIX}:${HEX_NUM}"
+
     mkdir -p "/var/lib/libvirt/qemu/cloud-init/${NAME}"
     cd "/var/lib/libvirt/qemu/cloud-init/${NAME}"
 
@@ -186,7 +390,41 @@ users:
     shell: /bin/bash
 EOF
 
-    genisoimage -quiet -output cidata.iso -V cidata -r -J user-data meta-data
+    cat <<EOF > network-config
+network:
+  version: 2
+  ethernets:
+    eth0:
+      match:
+        macaddress: '${VM_MAC_MGMT[${NAME}]}'
+      set-name: eth0
+    eth1:
+      match:
+        macaddress: '${VM_MAC_KUBE[${NAME}]}'
+      set-name: eth1
+    eth2:
+      match:
+        macaddress: '${VM_MAC_BREX[${NAME}]}'
+      set-name: eth2
+  bridges:
+    ${MGMT_BRIDGE}:
+      interfaces: [eth0]
+      addresses: [ ${VM_IP_MGMT[${NAME}]}/24 ]
+      nameservers:
+        search: [${CLUSTER_NAME}]
+        addresses: [69.20.0.164, 1.1.1.1]
+      routes:
+        - to: default
+          via: ${HOST_MGMT_IP}
+    ${KUBE_BRIDGE}:
+      interfaces: [eth1]
+      addresses: [ ${VM_IP_KUBE[${NAME}]}/24 ]
+    ${BREX_BRIDGE}:
+      interfaces: [eth2]
+      # addrs for br-ex handled by neutron
+EOF
+
+    genisoimage -quiet -output cidata.iso -V cidata -r -J user-data meta-data network-config
 
     EXTRA_DISKS=""
     if [[ ! -z ${VM_EXTRA_DISKS[${VM_TYPE}]-} ]] ; then
@@ -197,7 +435,7 @@ EOF
     fi
 
     lvcreate --type raid0 -L "${VM_ROOT_DISK["${VM_TYPE}"]}G" --nosync -n "lv_${NAME}" vg_libvirt
-    dd if=/root/jammy-server-cloudimg-amd64.raw bs=16M of="/dev/vg_libvirt/lv_${NAME}" status=progress
+    dd if=/root/jammy-server-cloudimg-amd64.raw bs=16M of="/dev/vg_libvirt/lv_${NAME}"
 
     virt-install \
       --name="${NAME}" \
@@ -208,12 +446,12 @@ EOF
       --disk path=/var/lib/libvirt/qemu/cloud-init/${NAME}/cidata.iso,device=cdrom \
       ${EXTRA_DISKS} \
       --os-variant=ubuntu22.04 \
-      --network bridge=virbr0,model=virtio \
+      --network bridge=${MGMT_BRIDGE},mac=${VM_MAC_MGMT[${NAME}]},model=virtio \
+      --network bridge=${KUBE_BRIDGE},mac=${VM_MAC_KUBE[${NAME}]},model=virtio \
+      --network bridge=${BREX_BRIDGE},mac=${VM_MAC_BREX[${NAME}]},model=virtio \
       --graphics none \
       --serial file,path=/var/lib/libvirt/qemu/console/${NAME}.log \
       --noautoconsole
-
-    sleep ${SLEEP_BETWEEN_VMS}
   done
 done
 
@@ -225,7 +463,7 @@ for VM_TYPE in ${VM_TYPES} ; do
     echo "Checking ${FQDN} ..."
     until grep -q "${NAME} login:" /var/lib/libvirt/qemu/console/${NAME}.log ; do
       echo "Still waiting for ${FQDN} to boot..."
-      sleep 2
+      sleep 1
     done
     echo "${FQDN} OK"
   done
@@ -238,17 +476,11 @@ INVENTORY=$(mktemp)
 
 echo "[all]" > ${INVENTORY}
 
-for VM_TYPE in ${VM_TYPES} ; do
-  for SEQ in $( seq 1 ${NUM_VMS[${VM_TYPE}]}) ; do
-    NAME="${VM_TYPE}${SEQ}"
+for NAME in ${LIST_OF_VMS} ; do
     FQDN="${NAME}.${CLUSTER_NAME}"
     echo "Adding ${FQDN} to inventory"
-    # taking the long way around because sometimes dnsmasq gets confused about names
-    #IP="$(virsh net-dhcp-leases default | grep ${NAME} | awk '{print $5}' | cut -d'/' -f1)"
-    IP="$(virsh net-dhcp-leases default | grep $(virsh domiflist ${NAME} | awk "/virbr0/ {print \$5}") | awk '{print $5}' | cut -d'/' -f1)"
-    echo "${FQDN} ansible_host=${IP} ip=${IP} ansible_user=ubuntu ansible_become=true" >> ${INVENTORY}
-    echo "${IP} ${NAME} ${FQDN}" >> /etc/hosts
-  done
+    echo "${FQDN} ansible_host=${VM_IP_MGMT[${NAME}]} ip=${VM_IP_KUBE[${NAME}]} ansible_user=ubuntu ansible_become=true" >> ${INVENTORY}
+    echo "${VM_IP_MGMT[${NAME}]} ${NAME} ${FQDN}" >> /etc/hosts
 done
 
 cat <<EOF >> ${INVENTORY}
@@ -256,6 +488,7 @@ cat <<EOF >> ${INVENTORY}
 ansible_ssh_common_args='-o StrictHostKeyChecking=accept-new'
 cluster_name=${CLUSTER_NAME}
 download_run_once=True
+upstream_dns_servers=["69.20.0.164","1.1.1.1"]
 #kube_ovn_iface=ens4
 #kube_ovn_default_interface_name=ens3
 EOF
@@ -355,11 +588,14 @@ cd /opt/genestack/submodules/openstack-helm-infra
 make all
 
 cd /opt/genestack/submodules/kubespray
-#ansible -m wait_for -a 'port=22 timeout=300' -i ${INVENTORY} all
+# add self to /etc/hosts (sometimes sudo times out due to name resolution)
+ansible -m shell -a "echo 127.0.0.1 {{ inventory_hostname_short }} {{ inventory_hostname }} >> /etc/hosts" -i ${INVENTORY} all
 # set fqdn to make kube happy
 ansible -m shell -a 'hostnamectl set-hostname {{ inventory_hostname }}' -i ${INVENTORY} all
 # force facts (on dirty systems old facts can confuse ansible)
 ansible -m setup -i ${INVENTORY} all
+
+#### kube spray ####
 
 ansible-playbook -i ${INVENTORY} cluster.yml
 
@@ -410,30 +646,19 @@ kubectl get nodes -o wide
 
 kubectl apply -k /opt/genestack/kustomize/rook-operator/ --wait
 
-echo "waiting for v1.ceph.rook.io ..."
-until kubectl get apiservice v1.ceph.rook.io ; do echo "still waiting for apiservice v1.ceph.rook.io ..." ; sleep 1 ; done
-kubectl wait apiservice v1.ceph.rook.io --for=jsonpath='.status.conditions[0].status'=True --timeout=60s
-
-echo "waiting for v1alpha1.objectbucket.io..."
-until kubectl get apiservice v1alpha1.objectbucket.io ; do echo "still waiting for v1alpha1.objectbucket.io ..." ; sleep 1 ; done
-kubectl wait apiservice v1alpha1.objectbucket.io --for=jsonpath='.status.conditions[0].status'=True --timeout=60s
+wait_for_a_kube_thing kube-public apiservice v1.ceph.rook.io ".status.conditions[0].status" True
+wait_for_a_kube_thing kube-public apiservice v1alpha1.objectbucket.io ".status.conditions[0].status" True
 
 kubectl apply -k /opt/genestack/kustomize/rook-cluster/  --wait
 
-echo "making a ceph"
-until kubectl -n rook-ceph get cephclusters.ceph.rook.io rook-ceph ; do echo "waiting for kube to catch up..." ; sleep 1 ; done
-until kubectl -n rook-ceph wait cephclusters.ceph.rook.io rook-ceph --for=jsonpath='.status.phase="Ready"' --timeout 30s ; do
-  echo "ceph cluster still cooking, please enjoy some logs while we wait..."
-  kubectl -n rook-ceph get cephclusters.ceph.rook.io rook-ceph
-  kubectl -n rook-ceph logs deploy/rook-ceph-operator --tail=10
-  sleep 1
-done
-
-kubectl -n rook-ceph get cephclusters.ceph.rook.io rook-ceph
+echo "Making a ceph cluster. This can take some time. You might want to watch `kubectl -n rook-ceph logs deploy/rook-ceph-operator -f` in a separate window."
+wait_for_a_kube_thing rook-ceph cephclusters.ceph.rook.io rook-ceph ".status.phase" Ready
 
 kubectl apply -k /opt/genestack/kustomize/rook-defaults
 
 kubectl apply -k /opt/genestack/kustomize/openstack
+
+#### mariadb ####
 
 kubectl --namespace openstack \
         create secret generic mariadb \
@@ -443,6 +668,54 @@ kubectl --namespace openstack \
 
 kubectl kustomize --enable-helm /opt/genestack/kustomize/mariadb-operator | kubectl --namespace mariadb-system apply --server-side --force-conflicts -f -
 
+wait_for_a_kube_thing kube-public apiservice v1alpha1.mariadb.mmontes.io
+
 kubectl --namespace openstack apply -k /opt/genestack/kustomize/mariadb-cluster/base
 
 kubectl -n openstack get mariadb mariadb-galera
+
+
+#### rabbitmq ####
+
+kubectl apply -k /opt/genestack/kustomize/rabbitmq-operator
+
+kubectl apply -k /opt/genestack/kustomize/rabbitmq-topology-operator
+
+wait_for_a_kube_thing kube-public apiservice v1alpha1.rabbitmq.com
+wait_for_a_kube_thing kube-public apiservice v1beta1.rabbitmq.com
+
+kubectl apply -k /opt/genestack/kustomize/rabbitmq-cluster/base
+
+wait_for_a_kube_thing openstack rabbitmqclusters.rabbitmq.com rabbitmq ".status.conditions[] | select(.type==\"AllReplicasReady\").status" "True"
+
+
+#### memcached ####
+
+kubectl kustomize --enable-helm /opt/genestack/kustomize/memcached/base | kubectl apply --namespace openstack -f -
+
+# TODO: verify memcached (kubectl --namespace openstack get horizontalpodautoscaler.autoscaling memcached -w)
+
+
+#### ingress controllers ####
+
+kubectl kustomize --enable-helm /opt/genestack/kustomize/ingress/external | kubectl apply --namespace ingress-nginx -f -
+
+kubectl kustomize --enable-helm /opt/genestack/kustomize/ingress/internal | kubectl apply --namespace openstack -f -
+
+
+#### metallb ####
+
+kubectl apply -f /opt/genestack/manifests/metallb/metallb-openstack-service-lb.yml
+
+kubectl --namespace openstack patch service ingress -p '{"metadata":{"annotations":{"metallb.universe.tf/allow-shared-ip": "openstack-external-svc", "metallb.universe.tf/address-pool": "openstack-external"}}}'
+kubectl --namespace openstack patch service ingress -p '{"spec": {"type": "LoadBalancer"}}'
+
+kubectl --namespace openstack get services ingress
+
+
+#### libvirt ####
+
+kubectl kustomize --enable-helm /opt/genestack/kustomize/libvirt | kubectl apply --namespace openstack -f -
+
+
+#### ovn ####
