@@ -116,7 +116,7 @@ wait_for_a_kube_thing () {
 
   # wait for condition to be met
   if [[ ! -z ${CONDITION_PATH} ]] ; then
-    # The sane thing would be to do "kubectl wait" but it can't filter for objects in an array until 1.31 and this initially targets 1.26
+    # The sane thing would be to do "kubectl wait" but it can't filter for objects in an array until 1.29 and this initially targets 1.26
     # ref: https://github.com/kubernetes/kubernetes/pull/118748
     # And the whole reason we're in this function is "kubectl wait" can't wait for a thing that doesn't exist yet so we might as well keep at it
     # until kubectl -n ${NAMESPACE} wait ${OBJECT_TYPE} ${OBJECT_NAME} --for=jsonpath="${CONDITION_PATH}"=${CONDITION_WANT} --timeout 10s ; do
