@@ -14,6 +14,11 @@ STORAGE_DEVICES="/dev/sdc /dev/sdd"
 
 CLUSTER_NAME="lab.local"
 
+export CONTAINER_DISTRO_NAME=ubuntu
+export CONTAINER_DISTRO_VERSION=jammy
+export OPENSTACK_RELEASE=2023.1
+export OSH_DEPLOY_MULTINODE=True
+
 VM_TYPES="utility controller compute network storage"
 
 declare -A NUM_VMS
@@ -69,7 +74,7 @@ KUBE_MAC_PREFIX="de:ad:be:ef:11"
 
 BREX_BRIDGE="br-ex"
 # br-ex IPs go to neutron not the vms but we still need the space reserved
-BREX_IP_PREFIX="192.168.140"
+BREX_IP_PREFIX="192.168.140" 
 BREX_MAC_PREFIX="de:ad:be:ef:22"
 
 IPTABLES_V4_CONF="/etc/iptables/rules.v4"
@@ -107,24 +112,28 @@ wait_for_a_kube_thing () {
   OBJECT_NAME=$3
   CONDITION_PATH=${4:-}
   CONDITION_WANT=${5:-True}
+  SLEEP=${6:-1}
 
   # wait for object to exist
-  until kubectl -n ${NAMESPACE} get ${OBJECT_TYPE} ${OBJECT_NAME} ; do sleep 1 ; done
+  until kubectl -n ${NAMESPACE} get ${OBJECT_TYPE} ${OBJECT_NAME} 2>&- ; do 
+    echo "Waiting for ${OBJECT_TYPE} ${OBJECT_NAME} to exist..."
+    sleep 1
+  done
 
   # print condition
   kubectl -n ${NAMESPACE} get ${OBJECT_TYPE} ${OBJECT_NAME} -o json | jq -c '.status'
 
   # wait for condition to be met
   if [[ ! -z ${CONDITION_PATH} ]] ; then
-    # The sane thing would be to do "kubectl wait" but it can't filter for objects in an array until 1.29 and this initially targets 1.26
+    # The sane thing would be to do "kubectl wait" but it can't filter for objects in an array until 1.31 and this initially targets 1.26
     # ref: https://github.com/kubernetes/kubernetes/pull/118748
     # And the whole reason we're in this function is "kubectl wait" can't wait for a thing that doesn't exist yet so we might as well keep at it
     # until kubectl -n ${NAMESPACE} wait ${OBJECT_TYPE} ${OBJECT_NAME} --for=jsonpath="${CONDITION_PATH}"=${CONDITION_WANT} --timeout 10s ; do
     until [[ "$(kubectl -n ${NAMESPACE} get ${OBJECT_TYPE} ${OBJECT_NAME} -o json | jq -r "${CONDITION_PATH}")" == "${CONDITION_WANT}" ]] ; do
-      echo "Still waiting for ${NAMESPACE} ${OBJECT_TYPE} ${OBJECT_NAME}..."
+      echo "Still waiting for ${NAMESPACE} ${OBJECT_TYPE} ${OBJECT_NAME} check back in ${SLEEP}..."
       echo "  ${OBJECT_NAME} ${CONDITION_PATH} = $(kubectl -n ${NAMESPACE} get ${OBJECT_TYPE} ${OBJECT_NAME} -o json | jq -r "${CONDITION_PATH}") want ${CONDITION_WANT}"
       kubectl -n ${NAMESPACE} get ${OBJECT_TYPE} ${OBJECT_NAME}
-      sleep 1
+      sleep ${SLEEP}
     done
   kubectl -n ${NAMESPACE} get ${OBJECT_TYPE} ${OBJECT_NAME} -o json | jq -c '.status'
   fi
@@ -489,8 +498,7 @@ ansible_ssh_common_args='-o StrictHostKeyChecking=accept-new'
 cluster_name=${CLUSTER_NAME}
 download_run_once=True
 upstream_dns_servers=["69.20.0.164","1.1.1.1"]
-#kube_ovn_iface=ens4
-#kube_ovn_default_interface_name=ens3
+cert_manager_enabled=true
 EOF
 
 echo "[bastion]" >> ${INVENTORY}
@@ -561,25 +569,18 @@ python3 -m venv ~/.venvs/kubespray
 source ~/.venvs/kubespray/bin/activate
 pip install -r /opt/genestack/submodules/kubespray/requirements.txt
 cd /opt/genestack/submodules/kubespray/inventory
-ln -sf /opt/genestack/openstack-flex .
 
 
 #### copy inventory ####
 
 cp ${INVENTORY} /opt/genestack/inventory.ini
-cp ${INVENTORY} /opt/genestack/openstack-flex/inventory.ini
-cp ${INVENTORY} /opt/genestack/submodules/kubespray/inventory/inventory.ini
+#cp ${INVENTORY} /opt/genestack/submodules/kubespray/inventory/inventory.ini
 rm ${INVENTORY}
-INVENTORY=/opt/genestack/openstack-flex/inventory.ini
+INVENTORY=/opt/genestack/inventory.ini
 
 if [[ -z "$(which helm)" ]] ; then
   curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 fi
-
-export CONTAINER_DISTRO_NAME=ubuntu
-export CONTAINER_DISTRO_VERSION=jammy
-export OPENSTACK_RELEASE=2023.1
-export OSH_DEPLOY_MULTINODE=True
 
 cd /opt/genestack/submodules/openstack-helm
 make all
@@ -614,7 +615,7 @@ cd ~
 kubectl get nodes -o wide
 
 
-#### start configuring for openstack ####
+#### un-taint controllers (let openstack control plane sleep on kube's couch) and label nodes ####
 
 kubectl taint nodes $(kubectl get nodes -l node-role.kubernetes.io/control-plane -o 'jsonpath={.items[*].metadata.name}' ) node-role.kubernetes.io/control-plane:NoSchedule-
 
@@ -636,11 +637,10 @@ kubectl label node $(kubectl get nodes | awk '/storage/ {print $1}') openstack-s
 # With OVN we need the compute nodes to be "network" nodes as well. While they will be configured for networking, they wont be gateways.
 kubectl label node $(kubectl get nodes | awk '/compute/ {print $1}') openstack-network-node=enabled
 
-# Label all workers - Recommended and used when deploying Kubernetes specific services
+# Label all workers - Recommended and used when deploying Kubernetes specific services 
 kubectl label node $(kubectl get nodes -l 'node-role.kubernetes.io/control-plane' -o 'jsonpath={.items[*].metadata.name}') node-role.kubernetes.io/worker=worker
 
 kubectl get nodes -o wide
-
 
 #### we're kubin now, do the ceph thing ####
 
@@ -651,10 +651,11 @@ wait_for_a_kube_thing kube-public apiservice v1alpha1.objectbucket.io ".status.c
 
 kubectl apply -k /opt/genestack/kustomize/rook-cluster/  --wait
 
-echo "Making a ceph cluster. This can take some time. You might want to watch `kubectl -n rook-ceph logs deploy/rook-ceph-operator -f` in a separate window."
-wait_for_a_kube_thing rook-ceph cephclusters.ceph.rook.io rook-ceph ".status.phase" Ready
+wait_for_a_kube_thing rook-ceph cephclusters.ceph.rook.io rook-ceph ".status.phase" Ready 30
 
 kubectl apply -k /opt/genestack/kustomize/rook-defaults
+
+#### starting openstack ####
 
 kubectl apply -k /opt/genestack/kustomize/openstack
 
@@ -669,6 +670,10 @@ kubectl --namespace openstack \
 kubectl kustomize --enable-helm /opt/genestack/kustomize/mariadb-operator | kubectl --namespace mariadb-system apply --server-side --force-conflicts -f -
 
 wait_for_a_kube_thing kube-public apiservice v1alpha1.mariadb.mmontes.io
+wait_for_a_kube_thing openstack crd backups.mariadb.mmontes.io ".status.conditions[] | select(.type==\"Established\").status" "True"
+wait_for_a_kube_thing openstack crd mariadbs.mariadb.mmontes.io ".status.conditions[] | select(.type==\"Established\").status" "True"
+wait_for_a_kube_thing mariadb-system deployment mariadb-operator ".status.conditions[] | select(.type==\"Available\").status" "True"
+wait_for_a_kube_thing mariadb-system deployment mariadb-operator-webhook ".status.conditions[] | select(.type==\"Available\").status" "True"
 
 kubectl --namespace openstack apply -k /opt/genestack/kustomize/mariadb-cluster/base
 
@@ -719,3 +724,4 @@ kubectl kustomize --enable-helm /opt/genestack/kustomize/libvirt | kubectl apply
 
 
 #### ovn ####
+
