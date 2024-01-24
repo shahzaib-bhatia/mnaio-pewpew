@@ -1,2 +1,2 @@
 # mnaio-pewpew
-One step (hopefully) deployment of openstack-ansible multi-node-aio on rackspace public cloud onmetal
+Soon-to-be one-step deployment of [genestack](https://github.com/rackerlabs/genestack/)-flavored openstack like the multinode-all-in-one of yore.
