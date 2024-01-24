@@ -1,6 +1,3 @@
-# cleanup resources
-# no hashbang for safety
-# don't run it unless you mean it
 for VM in $(virsh list --uuid) ; do
   virsh destroy ${VM}
   virsh undefine ${VM}
@@ -14,7 +11,12 @@ virsh net-destroy default
 > /var/lib/libvirt/dnsmasq/virbr0.status
 virsh net-start default
 
+for BRIDGE in br-mgmt br-kube br-ex ; do
+  ip link set ${BRIDGE} down
+  brctl delbr ${BRIDGE}
+done
+
 rm -rvf /opt/genestack
-rm -rvf ~/.venvs/kubespray
+rm -rvf ~/.venvs/kubespray 
 
 rm -v /root/.ssh/known_hosts
