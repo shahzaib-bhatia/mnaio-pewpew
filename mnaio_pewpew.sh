@@ -688,6 +688,9 @@ kubectl apply -k /opt/genestack/kustomize/rabbitmq-topology-operator
 
 wait_for_a_kube_thing kube-public apiservice v1alpha1.rabbitmq.com
 wait_for_a_kube_thing kube-public apiservice v1beta1.rabbitmq.com
+wait_for_a_kube_thing openstack crd rabbitmqclusters.rabbitmq.com ".status.conditions[] | select(.type==\"Established\").status" "True"
+wait_for_a_kube_thing rabbitmq-system deployment rabbitmq-cluster-operator ".status.conditions[] | select(.type==\"Available\").status" "True"
+wait_for_a_kube_thing messaging-topology-operator deployment rabbitmq-cluster-operator ".status.conditions[] | select(.type==\"Available\").status" "True"
 
 kubectl apply -k /opt/genestack/kustomize/rabbitmq-cluster/base
 
