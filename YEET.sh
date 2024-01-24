@@ -1,4 +1,4 @@
-for VM in $(virsh list --uuid) ; do
+for VM in $(virsh list --uuid --all) ; do
   virsh destroy ${VM}
   virsh undefine ${VM}
 done
@@ -6,10 +6,6 @@ lvremove -y vg_libvirt
 
 rm -v /usr/local/bin/kubectl
 rm -v /root/.kube/config
-
-virsh net-destroy default
-> /var/lib/libvirt/dnsmasq/virbr0.status
-virsh net-start default
 
 for BRIDGE in br-mgmt br-kube br-ex ; do
   ip link set ${BRIDGE} down
