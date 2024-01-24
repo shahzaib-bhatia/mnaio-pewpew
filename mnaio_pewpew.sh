@@ -428,9 +428,6 @@ network:
     ${KUBE_BRIDGE}:
       interfaces: [eth1]
       addresses: [ ${VM_IP_KUBE[${NAME}]}/24 ]
-    ${BREX_BRIDGE}:
-      interfaces: [eth2]
-      # addrs for br-ex handled by neutron
 EOF
 
     genisoimage -quiet -output cidata.iso -V cidata -r -J user-data meta-data network-config
@@ -688,9 +685,10 @@ kubectl apply -k /opt/genestack/kustomize/rabbitmq-topology-operator
 
 wait_for_a_kube_thing kube-public apiservice v1alpha1.rabbitmq.com
 wait_for_a_kube_thing kube-public apiservice v1beta1.rabbitmq.com
-wait_for_a_kube_thing openstack crd rabbitmqclusters.rabbitmq.com ".status.conditions[] | select(.type==\"Established\").status" "True"
 wait_for_a_kube_thing rabbitmq-system deployment rabbitmq-cluster-operator ".status.conditions[] | select(.type==\"Available\").status" "True"
-wait_for_a_kube_thing messaging-topology-operator deployment rabbitmq-cluster-operator ".status.conditions[] | select(.type==\"Available\").status" "True"
+wait_for_a_kube_thing rabbitmq-system deployment messaging-topology-operator ".status.conditions[] | select(.type==\"Available\").status" "True"
+wait_for_a_kube_thing openstack crd rabbitmqclusters.rabbitmq.com ".status.conditions[] | select(.type==\"Established\").status" "True"
+wait_for_a_kube_thing openstack crd rabbitmqclusters.rabbitmq.com ".status.acceptedNames.kind" "RabbitmqCluster"
 
 kubectl apply -k /opt/genestack/kustomize/rabbitmq-cluster/base
 
@@ -700,9 +698,6 @@ wait_for_a_kube_thing openstack rabbitmqclusters.rabbitmq.com rabbitmq ".status.
 #### memcached ####
 
 kubectl kustomize --enable-helm /opt/genestack/kustomize/memcached/base | kubectl apply --namespace openstack -f -
-
-# TODO: verify memcached (kubectl --namespace openstack get horizontalpodautoscaler.autoscaling memcached -w)
-
 
 #### ingress controllers ####
 
@@ -728,3 +723,69 @@ kubectl kustomize --enable-helm /opt/genestack/kustomize/libvirt | kubectl apply
 
 #### ovn ####
 
+export ALL_NODES=$(kubectl get nodes -l 'openstack-network-node=enabled' -o 'jsonpath={.items[*].metadata.name}')
+
+kubectl annotate \
+        nodes \
+        ${ALL_NODES} \
+        ovn.openstack.org/int_bridge='br-int'
+
+kubectl annotate \
+        nodes \
+        ${ALL_NODES} \
+        ovn.openstack.org/ports='br-ex:eth2'
+
+kubectl annotate \
+        nodes \
+        ${ALL_NODES} \
+        ovn.openstack.org/mappings='physnet1:br-ex'
+
+kubectl annotate \
+        nodes \
+        ${ALL_NODES} \
+        ovn.openstack.org/availability_zones='nova'
+
+if [[ ${NUM_VMS["network"]:-0} -eq 0 ]] ; then
+	kubectl annotate node $(kubectl get nodes -l 'openstack-network-node=enabled' | awk '/compute/ {print $1}') ovn.openstack.org/gateway='enabled'
+else
+	kubectl annotate node $(kubectl get nodes -l 'openstack-network-node=enabled' | awk '/network/ {print $1}') ovn.openstack.org/gateway='enabled'
+fi
+
+kubectl --namespace openstack apply -k /opt/genestack/kustomize/ovn
+
+kubectl --namespace openstack \
+        create secret generic keystone-rabbitmq-password \
+        --type Opaque \
+        --from-literal=username="keystone" \
+        --from-literal=password="$(pwgen -s 64 1)"
+kubectl --namespace openstack \
+        create secret generic keystone-db-password \
+        --type Opaque \
+        --from-literal=password="$(pwgen -s 32 1)"
+kubectl --namespace openstack \
+        create secret generic keystone-admin \
+        --type Opaque \
+        --from-literal=password="$(pwgen -s 32 1)"
+kubectl --namespace openstack \
+        create secret generic keystone-credential-keys \
+        --type Opaque \
+        --from-literal=password="$(pwgen -s 32 1)"
+
+cd /opt/genestack/submodules/openstack-helm
+
+helm upgrade --install keystone ./keystone \
+    --namespace=openstack \
+    --wait \
+    --timeout 120m \
+    -f /opt/genestack/helm-configs/keystone/keystone-helm-overrides.yaml \
+    --set endpoints.identity.auth.admin.password="$(kubectl --namespace openstack get secret keystone-admin -o jsonpath='{.data.password}' | base64 -d)" \
+    --set endpoints.oslo_db.auth.admin.password="$(kubectl --namespace openstack get secret mariadb -o jsonpath='{.data.root-password}' | base64 -d)" \
+    --set endpoints.oslo_db.auth.keystone.password="$(kubectl --namespace openstack get secret keystone-db-password -o jsonpath='{.data.password}' | base64 -d)" \
+    --set endpoints.oslo_messaging.auth.admin.password="$(kubectl --namespace openstack get secret rabbitmq-default-user -o jsonpath='{.data.password}' | base64 -d)" \
+    --set endpoints.oslo_messaging.auth.keystone.password="$(kubectl --namespace openstack get secret keystone-rabbitmq-password -o jsonpath='{.data.password}' | base64 -d)" \
+    --post-renderer /opt/genestack/kustomize/kustomize.sh \
+    --post-renderer-args keystone/base
+
+kubectl --namespace openstack apply -f /opt/genestack/manifests/utils/utils-openstack-client-admin.yaml
+
+kubectl --namespace openstack exec -ti openstack-admin-client -- openstack user list
