@@ -170,6 +170,13 @@ set -euf
 set -o pipefail
 
 
+#### sometimes bash gets confused after a reboot ####
+
+if [[ -z "${HOME}" ]] ; then
+  export HOME="/root"
+fi
+
+
 #### get space ####
 
 for STORAGE_DEVICE in ${STORAGE_DEVICES} ; do
@@ -495,7 +502,11 @@ ansible_ssh_common_args='-o StrictHostKeyChecking=accept-new'
 cluster_name=${CLUSTER_NAME}
 download_run_once=True
 upstream_dns_servers=["69.20.0.164","1.1.1.1"]
+# deps
+kube_network_plugin=kube-ovn
 cert_manager_enabled=true
+kube_proxy_strict_arp=true
+metallb_enabled=true
 EOF
 
 echo "[bastion]" >> ${INVENTORY}
@@ -607,7 +618,7 @@ ansible 'kube_control_plane[0]' -i ${INVENTORY} -m fetch -a 'src=/root/.kube/con
 chmod +x /usr/local/bin/kubectl
 chmod 0600 /root/.kube/config
 sed -i "s/127\.0\.0\.1/controller1.${CLUSTER_NAME}/" /root/.kube/config
-
+export KUBECONFIG='/root/.kube/config'
 cd ~
 kubectl get nodes -o wide
 
@@ -645,6 +656,9 @@ kubectl apply -k /opt/genestack/kustomize/rook-operator/ --wait
 
 wait_for_a_kube_thing kube-public apiservice v1.ceph.rook.io ".status.conditions[0].status" True
 wait_for_a_kube_thing kube-public apiservice v1alpha1.objectbucket.io ".status.conditions[0].status" True
+wait_for_a_kube_thing rook-ceph crd cephclusters.ceph.rook.io ".status.conditions[] | select(.type==\"Established\").status" "True"
+wait_for_a_kube_thing rook-ceph crd cephclusters.ceph.rook.io ".status.acceptedNames.kind" "CephCluster"
+
 
 kubectl apply -k /opt/genestack/kustomize/rook-cluster/  --wait
 
@@ -664,7 +678,10 @@ kubectl --namespace openstack \
         --from-literal=root-password="$(pwgen -s 32 1)" \
         --from-literal=password="$(pwgen -s 32 1)"
 
-kubectl kustomize --enable-helm /opt/genestack/kustomize/mariadb-operator | kubectl --namespace mariadb-system apply --server-side --force-conflicts -f -
+                                                                          # very cloud
+kubectl kustomize --enable-helm /opt/genestack/kustomize/mariadb-operator | sed "s/cluster\.local/${CLUSTER_NAME}/g"| kubectl --namespace mariadb-system apply --server-side --force-conflicts -f -
+# persist changes
+sed -i "s/^clusterName: .*$/clusterName: ${CLUSTER_NAME}/" /opt/genestack/kustomize/mariadb-operator/charts/mariadb-operator/values.yaml
 
 wait_for_a_kube_thing kube-public apiservice v1alpha1.mariadb.mmontes.io
 wait_for_a_kube_thing openstack crd backups.mariadb.mmontes.io ".status.conditions[] | select(.type==\"Established\").status" "True"
@@ -692,7 +709,7 @@ wait_for_a_kube_thing openstack crd rabbitmqclusters.rabbitmq.com ".status.accep
 
 kubectl apply -k /opt/genestack/kustomize/rabbitmq-cluster/base
 
-wait_for_a_kube_thing openstack rabbitmqclusters.rabbitmq.com rabbitmq ".status.conditions[] | select(.type==\"AllReplicasReady\").status" "True"
+wait_for_a_kube_thing openstack rabbitmqclusters.rabbitmq.com rabbitmq ".status.conditions[] | select(.type==\"AllReplicasReady\").status" "True" 30
 
 
 #### memcached ####
@@ -728,17 +745,22 @@ export ALL_NODES=$(kubectl get nodes -l 'openstack-network-node=enabled' -o 'jso
 kubectl annotate \
         nodes \
         ${ALL_NODES} \
+        ovn.openstack.org/bridges="${BREX_BRIDGE}"
+
+kubectl annotate \
+        nodes \
+        ${ALL_NODES} \
         ovn.openstack.org/int_bridge='br-int'
 
 kubectl annotate \
         nodes \
         ${ALL_NODES} \
-        ovn.openstack.org/ports='br-ex:eth2'
+        ovn.openstack.org/ports="${BREX_BRIDGE}:eth2"
 
 kubectl annotate \
         nodes \
         ${ALL_NODES} \
-        ovn.openstack.org/mappings='physnet1:br-ex'
+        ovn.openstack.org/mappings="physnet1:${BREX_BRIDGE}"
 
 kubectl annotate \
         nodes \
