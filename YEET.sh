@@ -1,3 +1,5 @@
+if [[ $(type -t deactivate) == "function" ]] ; then  deactivate ; fi
+
 for VM in $(virsh list --uuid --all) ; do
   virsh destroy ${VM}
   virsh undefine ${VM}
