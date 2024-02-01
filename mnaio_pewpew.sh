@@ -691,6 +691,8 @@ wait_for_a_kube_thing mariadb-system deployment mariadb-operator-webhook ".statu
 
 kubectl --namespace openstack apply -k /opt/genestack/kustomize/mariadb-cluster/base
 
+wait_for_a_kube_thing openstack statefulset mariadb-galera ".status.availableReplicas" 3
+
 kubectl -n openstack get mariadb mariadb-galera
 
 
@@ -793,6 +795,11 @@ kubectl --namespace openstack \
         --type Opaque \
         --from-literal=password="$(pwgen -s 32 1)"
 
+
+set +f
+sed -i "s/cluster_domain_suffix: cluster.local/cluster_domain_suffix: ${CLUSTER_NAME}/" /opt/genestack/helm-configs/*/*.yaml
+set -f
+
 cd /opt/genestack/submodules/openstack-helm
 
 helm upgrade --install keystone ./keystone \
@@ -810,4 +817,64 @@ helm upgrade --install keystone ./keystone \
 
 kubectl --namespace openstack apply -f /opt/genestack/manifests/utils/utils-openstack-client-admin.yaml
 
+wait_for_a_kube_thing openstack pod openstack-admin-client "status.phase" "Running"
+
 kubectl --namespace openstack exec -ti openstack-admin-client -- openstack user list
+
+kubectl --namespace openstack \
+        create secret generic glance-rabbitmq-password \
+        --type Opaque \
+        --from-literal=username="glance" \
+        --from-literal=password="$(pwgen -s 64 1)"
+kubectl --namespace openstack \
+        create secret generic glance-db-password \
+        --type Opaque \
+        --from-literal=password="$(pwgen -s 32 1)"
+kubectl --namespace openstack \
+        create secret generic glance-admin \
+        --type Opaque \
+        --from-literal=password="$(pwgen -s 32 1)"
+
+helm upgrade --install glance ./glance \
+    --namespace=openstack \
+    --wait \
+    --timeout 120m \
+    -f /opt/genestack/helm-configs/glance/glance-helm-overrides.yaml \
+    --set endpoints.identity.auth.admin.password="$(kubectl --namespace openstack get secret keystone-admin -o jsonpath='{.data.password}' | base64 -d)" \
+    --set endpoints.identity.auth.glance.password="$(kubectl --namespace openstack get secret glance-admin -o jsonpath='{.data.password}' | base64 -d)" \
+    --set endpoints.oslo_db.auth.admin.password="$(kubectl --namespace openstack get secret mariadb -o jsonpath='{.data.root-password}' | base64 -d)" \
+    --set endpoints.oslo_db.auth.glance.password="$(kubectl --namespace openstack get secret glance-db-password -o jsonpath='{.data.password}' | base64 -d)" \
+    --set endpoints.oslo_messaging.auth.admin.password="$(kubectl --namespace openstack get secret rabbitmq-default-user -o jsonpath='{.data.password}' | base64 -d)" \
+    --set endpoints.oslo_messaging.auth.glance.password="$(kubectl --namespace openstack get secret glance-rabbitmq-password -o jsonpath='{.data.password}' | base64 -d)" \
+    --post-renderer /opt/genestack/kustomize/kustomize.sh \
+    --post-renderer-args glance/base
+
+kubectl --namespace openstack exec -ti openstack-admin-client -- openstack image list
+
+kubectl --namespace openstack \
+        create secret generic cinder-rabbitmq-password \
+        --type Opaque \
+        --from-literal=username="cinder" \
+        --from-literal=password="$(< /dev/urandom tr -dc _A-Za-z0-9 | head -c${1:-64};echo;)"
+kubectl --namespace openstack \
+        create secret generic cinder-db-password \
+        --type Opaque \
+        --from-literal=password="$(< /dev/urandom tr -dc _A-Za-z0-9 | head -c${1:-32};echo;)"
+kubectl --namespace openstack \
+        create secret generic cinder-admin \
+        --type Opaque \
+        --from-literal=password="$(< /dev/urandom tr -dc _A-Za-z0-9 | head -c${1:-32};echo;)"
+
+helm upgrade --install cinder ./cinder \
+  --namespace=openstack \
+    --wait \
+    --timeout 120m \
+    -f /opt/genestack/helm-configs/cinder/cinder-helm-overrides.yaml \
+    --set endpoints.identity.auth.admin.password="$(kubectl --namespace openstack get secret keystone-admin -o jsonpath='{.data.password}' | base64 -d)" \
+    --set endpoints.identity.auth.cinder.password="$(kubectl --namespace openstack get secret cinder-admin -o jsonpath='{.data.password}' | base64 -d)" \
+    --set endpoints.oslo_db.auth.admin.password="$(kubectl --namespace openstack get secret mariadb -o jsonpath='{.data.root-password}' | base64 -d)" \
+    --set endpoints.oslo_db.auth.cinder.password="$(kubectl --namespace openstack get secret cinder-db-password -o jsonpath='{.data.password}' | base64 -d)" \
+    --set endpoints.oslo_messaging.auth.admin.password="$(kubectl --namespace openstack get secret rabbitmq-default-user -o jsonpath='{.data.password}' | base64 -d)" \
+    --set endpoints.oslo_messaging.auth.cinder.password="$(kubectl --namespace openstack get secret cinder-rabbitmq-password -o jsonpath='{.data.password}' | base64 -d)" \
+    --post-renderer /opt/genestack/kustomize/kustomize.sh \
+    --post-renderer-args cinder/base
