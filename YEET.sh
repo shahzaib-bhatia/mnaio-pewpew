@@ -8,6 +8,7 @@ lvremove -y vg_libvirt
 
 rm -v /usr/local/bin/kubectl
 rm -v /root/.kube/config
+rm -rvf /var/lib/libvirt/qemu/cloud-init/ /var/lib/libvirt/qemu/console/
 
 for BRIDGE in br-mgmt br-kube br-ex ; do
   ip link set ${BRIDGE} down
