@@ -57,7 +57,7 @@ VM_EXTRA_DISKS_SIZE["storage"]="50"
 
 # Take these devices on the storage nodes for the cinder VG
 # the rest will get borg'd by rook
-CINDER_LVM_PVS="/dev/sdb /dev/sdc"
+CINDER_LVM_PVS="/dev/vdb /dev/vdc"
 
 # 1 for safer 0 for faster
 VM_ROOT_DISKS_RAID=0
@@ -98,11 +98,16 @@ declare -A VM_IP_KUBE
 declare -A VM_MAC_KUBE
 declare -A VM_IP_BREX
 declare -A VM_MAC_BREX
+declare -A VM_IP_STOR
+declare -A VM_MAC_STOR
 
-# sometimes bash gets confused after a reboot ####
+# sometimes bash gets confused after a reboot
 if [[ -z "${HOME}" ]] ; then
   export HOME="/root"
 fi
+
+# supposedly this is a default too
+export KUBECONFIG='/root/.kube/config'
 
 #### helpers ####
 
@@ -399,6 +404,8 @@ make_vms () {
       VM_MAC_KUBE[${NAME}]="${KUBE_MAC_PREFIX}:${HEX_NUM}"
       VM_IP_BREX[${NAME}]="${BREX_IP_PREFIX}.${NUM}"
       VM_MAC_BREX[${NAME}]="${BREX_MAC_PREFIX}:${HEX_NUM}"
+      VM_IP_STOR[${NAME}]="${STOR_IP_PREFIX}.${NUM}"
+      VM_MAC_STOR[${NAME}]="${STOR_MAC_PREFIX}:${HEX_NUM}"
 
       mkdir -p "/var/lib/libvirt/qemu/cloud-init/${NAME}"
       cd "/var/lib/libvirt/qemu/cloud-init/${NAME}"
@@ -437,6 +444,10 @@ network:
       match:
         macaddress: '${VM_MAC_BREX[${NAME}]}'
       set-name: eth2
+    eth3:
+      match:
+        macaddress: '${VM_MAC_STOR[${NAME}]}'
+      set-name: eth3
   bridges:
     ${MGMT_BRIDGE}:
       interfaces: [eth0]
@@ -450,6 +461,9 @@ network:
     ${KUBE_BRIDGE}:
       interfaces: [eth1]
       addresses: [ ${VM_IP_KUBE[${NAME}]}/24 ]
+    ${STOR_BRIDGE}:
+      interfaces: [eth3]
+      addresses: [ ${VM_IP_STOR[${NAME}]}/24 ]
 EOF
 
       genisoimage -quiet -output cidata.iso -V cidata -r -J user-data meta-data network-config
@@ -477,6 +491,7 @@ EOF
         --network bridge=${MGMT_BRIDGE},mac=${VM_MAC_MGMT[${NAME}]},model=virtio \
         --network bridge=${KUBE_BRIDGE},mac=${VM_MAC_KUBE[${NAME}]},model=virtio \
         --network bridge=${BREX_BRIDGE},mac=${VM_MAC_BREX[${NAME}]},model=virtio \
+        --network bridge=${STOR_BRIDGE},mac=${VM_MAC_STOR[${NAME}]},model=virtio \
         --graphics none \
         --serial file,path=/var/lib/libvirt/qemu/console/${NAME}.log \
         --noautoconsole
@@ -504,10 +519,10 @@ make_inventory () {
   echo "[all]" > ${TEMP_INVENTORY}
 
   for NAME in ${LIST_OF_VMS} ; do
-      FQDN="${NAME}.${CLUSTER_NAME}"
-      echo "Adding ${FQDN} to inventory"
-      echo "${FQDN} ansible_host=${VM_IP_MGMT[${NAME}]} ip=${VM_IP_KUBE[${NAME}]} ansible_user=ubuntu ansible_become=true" >> ${TEMP_INVENTORY}
-      echo "${VM_IP_MGMT[${NAME}]} ${NAME} ${FQDN}" >> /etc/hosts
+    FQDN="${NAME}.${CLUSTER_NAME}"
+    echo "Adding ${FQDN} to inventory"
+    echo "${FQDN} ansible_host=${VM_IP_MGMT[${NAME}]} ip=${VM_IP_KUBE[${NAME}]} ansible_user=ubuntu ansible_become=true" >> ${TEMP_INVENTORY}
+    echo "${VM_IP_MGMT[${NAME}]} ${NAME} ${FQDN}" >> /etc/hosts
   done
 
   cat <<EOF >> ${TEMP_INVENTORY}
@@ -571,6 +586,18 @@ EOF
     fi
   done
 
+  echo "[cinder_storage_nodes]" >> ${TEMP_INVENTORY}
+  WANT_TYPES="storage"
+  for VM_TYPE in ${WANT_TYPES} ; do
+    if [[ ! -z ${NUM_VMS[${VM_TYPE}]-} ]] ; then
+      for SEQ in $( seq 1 ${NUM_VMS[${VM_TYPE}]}) ; do
+        NAME="${VM_TYPE}${SEQ}"
+        FQDN="${NAME}.${CLUSTER_NAME}"
+        echo "${FQDN}" >> ${TEMP_INVENTORY}
+      done
+    fi
+  done
+
   cat <<EOF >> ${TEMP_INVENTORY}
 [k8s_cluster:children]
 kube_control_plane
@@ -617,16 +644,21 @@ make_genestack () {
 }
 
 prepare_vms () {
+  source ~/.venvs/kubespray/bin/activate
   # add self to /etc/hosts (sometimes sudo times out due to name resolution)
   ansible -m shell -a "echo 127.0.0.1 {{ inventory_hostname_short }} {{ inventory_hostname }} >> /etc/hosts" -i ${INVENTORY} all
   # set fqdn to make kube happy
   ansible -m shell -a 'hostnamectl set-hostname {{ inventory_hostname }}' -i ${INVENTORY} all
   # force facts (on dirty systems old facts can confuse ansible)
   ansible -m setup -i ${INVENTORY} all
+  # add cinder pvs to vg
+  ansible -m shell -a "pvcreate ${CINDER_LVM_PVS}" -i ${INVENTORY} cinder_storage_nodes
+  ansible -m shell -a "vgcreate lvmdriver-1 ${CINDER_LVM_PVS}" -i ${INVENTORY} cinder_storage_nodes
 }
 
 spray_kube () {
   cd /opt/genestack/submodules/kubespray
+  source ~/.venvs/kubespray/bin/activate
   ansible-playbook -i ${INVENTORY} cluster.yml
   # steal kubectl
   mkdir -p /root/.kube
@@ -636,7 +668,6 @@ spray_kube () {
   chmod +x /usr/local/bin/kubectl
   chmod 0600 /root/.kube/config
   sed -i "s/127\.0\.0\.1/controller1.${CLUSTER_NAME}/" /root/.kube/config
-  export KUBECONFIG='/root/.kube/config'
   cd ~
   kubectl get nodes -o wide
 }
@@ -820,7 +851,7 @@ install_keystone () {
 
   kubectl --namespace openstack apply -f /opt/genestack/manifests/utils/utils-openstack-client-admin.yaml
 
-  wait_for_a_kube_thing openstack pod openstack-admin-client "status.phase" "Running"
+  wait_for_a_kube_thing openstack pod openstack-admin-client ".status.phase" "Running"
 
   kubectl --namespace openstack exec -ti openstack-admin-client -- openstack user list
 }
@@ -894,6 +925,8 @@ install_openstack () {
   wrap_func install_cinder
 }
 
+
+#### Allow source or dot invocation (bash only for now) ####
 
 if [[ $0 == "-bash" ]] ; then
   echo "pew pew"
