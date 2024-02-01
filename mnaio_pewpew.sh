@@ -112,10 +112,10 @@ export KUBECONFIG='/root/.kube/config'
 #### helpers ####
 
 wrap_func () {
-  START="$(date +%s)"
+  local START="$(date +%s)"
   echo "$(date --rfc-3339=seconds) - Starting $@" >> ${LOG_FILE}
   $@
-  END="$(date +%s)"
+  local END="$(date +%s)"
   echo "$(date --rfc-3339=seconds) - Finished $@ (took $(( ${END} - ${START} )) seconds)" >> ${LOG_FILE}
 }
 
@@ -732,6 +732,7 @@ prepare_kube () {
 
   kubectl apply -k /opt/genestack/kustomize/rook-defaults
 
+  kubectl -n rook-ceph exec -it $(kubectl -n rook-ceph get pod -l "app=rook-ceph-tools" -o jsonpath='{.items[*].metadata.name}') -- ceph status
 
   #### openstack (just the namespace for now) ####
 
