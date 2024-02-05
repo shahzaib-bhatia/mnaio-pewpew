@@ -529,13 +529,16 @@ make_inventory () {
 [all:vars]
 ansible_ssh_common_args='-o StrictHostKeyChecking=accept-new'
 cluster_name=${CLUSTER_NAME}
+# note: for ansible reasons True is a bool and true is a string
+kubectl_localhost=True
+kubeconfig_localhost=True
 download_run_once=True
 upstream_dns_servers=["69.20.0.164","1.1.1.1"]
 # deps
 kube_network_plugin=kube-ovn
-cert_manager_enabled=true
-kube_proxy_strict_arp=true
-metallb_enabled=true
+cert_manager_enabled=True
+kube_proxy_strict_arp=True
+metallb_enabled=True
 EOF
 
   echo "[bastion]" >> ${TEMP_INVENTORY}
@@ -653,22 +656,35 @@ prepare_vms () {
   ansible -m setup -i ${INVENTORY} all
   # add cinder pvs to vg
   ansible -m shell -a "pvcreate ${CINDER_LVM_PVS}" -i ${INVENTORY} cinder_storage_nodes
-  ansible -m shell -a "vgcreate lvmdriver-1 ${CINDER_LVM_PVS}" -i ${INVENTORY} cinder_storage_nodes
+  ansible -m shell -a "vgcreate cinder-volumes-1 ${CINDER_LVM_PVS}" -i ${INVENTORY} cinder_storage_nodes
 }
 
 spray_kube () {
   cd /opt/genestack/submodules/kubespray
   source ~/.venvs/kubespray/bin/activate
   ansible-playbook -i ${INVENTORY} cluster.yml
-  # steal kubectl
+}
+
+steal_kube_conf () {
+  cd /opt/genestack/submodules/kubespray
+  source ~/.venvs/kubespray/bin/activate
+
+  # ansible copy has non-overrideable behavior changes based on src/dest strings so we need this to be a dir for ... reasons (it saves an ansible step)
+  KUBE_TMP_CONF="$(mktemp --directory)"
   mkdir -p /root/.kube
   chmod 0700 /root/.kube
   ansible 'kube_control_plane[0]' -i ${INVENTORY} -m fetch -a 'src=/usr/local/bin/kubectl dest=/usr/local/bin/kubectl flat=true'
-  ansible 'kube_control_plane[0]' -i ${INVENTORY} -m fetch -a 'src=/root/.kube/config dest=/root/.kube/config flat=true'
+  ansible 'kube_control_plane[0]' -i ${INVENTORY} -m fetch -a "src=/root/.kube/config dest=${KUBE_TMP_CONF}/ flat=true"
+  sed "s/127\.0\.0\.1/controller1.${CLUSTER_NAME}/" "${KUBE_TMP_CONF}/config" > /root/.kube/config
   chmod +x /usr/local/bin/kubectl
   chmod 0600 /root/.kube/config
-  sed -i "s/127\.0\.0\.1/controller1.${CLUSTER_NAME}/" /root/.kube/config
-  cd ~
+
+  # now that we have working kubectl here shove the internal ip in the conf and distribute it to cluster members
+  KUBE_INT_IP="$(kubectl get service kubernetes -o jsonpath='{.spec.clusterIP}')"
+  sed -i "s/127\.0\.0\.1:6443/${KUBE_INT_IP}:443/" "${KUBE_TMP_CONF}/config"
+  ansible 'all:!kube_control_plane' -i ${INVENTORY} -m copy -a "src=${KUBE_TMP_CONF}/config dest=/root/.kube/ mode=0600 directory_mode=0700"
+  rm "${KUBE_TMP_CONF}/config"
+  rmdir ${KUBE_TMP_CONF}
   kubectl get nodes -o wide
 }
 
@@ -813,7 +829,7 @@ prepare_kube () {
 
   #### wait for everything to be ready before we return ####
 
-  wait_for_a_kube_thing openstack statefulset mariadb-galera ".status.availableReplicas" 3
+  wait_for_a_kube_thing openstack statefulset mariadb-galera ".status.availableReplicas" 3 30
   wait_for_a_kube_thing openstack rabbitmqclusters.rabbitmq.com rabbitmq ".status.conditions[] | select(.type==\"AllReplicasReady\").status" "True" 3
 }
 
@@ -894,15 +910,15 @@ install_cinder () {
           create secret generic cinder-rabbitmq-password \
           --type Opaque \
           --from-literal=username="cinder" \
-          --from-literal=password="$(< /dev/urandom tr -dc _A-Za-z0-9 | head -c${1:-64};echo;)"
+          --from-literal=password="$(pwgen -s 64 1)"
   kubectl --namespace openstack \
           create secret generic cinder-db-password \
           --type Opaque \
-          --from-literal=password="$(< /dev/urandom tr -dc _A-Za-z0-9 | head -c${1:-32};echo;)"
+          --from-literal=password="$(pwgen -s 32 1)"
   kubectl --namespace openstack \
           create secret generic cinder-admin \
           --type Opaque \
-          --from-literal=password="$(< /dev/urandom tr -dc _A-Za-z0-9 | head -c${1:-32};echo;)"
+          --from-literal=password="$(pwgen -s 32 1)"
 
   helm upgrade --install cinder ./cinder \
                --namespace=openstack \
@@ -917,6 +933,193 @@ install_cinder () {
                --set endpoints.oslo_messaging.auth.cinder.password="$(kubectl --namespace openstack get secret cinder-rabbitmq-password -o jsonpath='{.data.password}' | base64 -d)" \
                --post-renderer /opt/genestack/kustomize/kustomize.sh \
                --post-renderer-args cinder/base
+
+  # cinder needs some non kube stuff to happen
+  source ~/.venvs/kubespray/bin/activate
+  # fix in place For Now(TM)
+  sed -i '/delegate_to:/d' /opt/genestack/ansible/playbooks/deploy-cinder-volumes-reference.yaml
+  sed -i 's/ansible_fqdn/inventory_hostname/' /opt/genestack/ansible/playbooks/deploy-cinder-volumes-reference.yaml
+  ansible-playbook -i ${INVENTORY} /opt/genestack/ansible/playbooks/deploy-cinder-volumes-reference.yaml
+  kubectl --namespace openstack exec -ti openstack-admin-client -- openstack volume type create lvmdriver-1
+  kubectl --namespace openstack exec -ti openstack-admin-client -- openstack volume service list
+}
+
+install_neutron () {
+	kubectl --namespace openstack \
+					create secret generic neutron-rabbitmq-password \
+					--type Opaque \
+					--from-literal=username="neutron" \
+					--from-literal=password="$(pwgen -s 32 1)"
+	kubectl --namespace openstack \
+					create secret generic neutron-db-password \
+					--type Opaque \
+					--from-literal=password="$(pwgen -s 32 1)"
+	kubectl --namespace openstack \
+					create secret generic neutron-admin \
+					--type Opaque \
+					--from-literal=password="$(pwgen -s 32 1)"
+
+	# need nova and related secrets early.
+	kubectl --namespace openstack \
+					create secret generic placement-db-password \
+					--type Opaque \
+					--from-literal=password="$(pwgen -s 32 1)"
+	kubectl --namespace openstack \
+					create secret generic placement-admin \
+					--type Opaque \
+					--from-literal=password="$(pwgen -s 32 1)"
+
+	kubectl --namespace openstack \
+					create secret generic nova-db-password \
+					--type Opaque \
+					--from-literal=password="$(pwgen -s 32 1)"
+	kubectl --namespace openstack \
+					create secret generic nova-admin \
+					--type Opaque \
+					--from-literal=password="$(pwgen -s 32 1)"
+	kubectl --namespace openstack \
+					create secret generic nova-rabbitmq-password \
+					--type Opaque \
+					--from-literal=username="nova" \
+					--from-literal=password="$(pwgen -s 32 1)"
+
+	# Ironic (NOT IMPLEMENTED YET)
+	kubectl --namespace openstack \
+					create secret generic ironic-admin \
+					--type Opaque \
+					--from-literal=password="$(pwgen -s 32 1)"
+
+	# Designate (NOT IMPLEMENTED YET)
+	kubectl --namespace openstack \
+					create secret generic designate-admin \
+					--type Opaque \
+					--from-literal=password="$(pwgen -s 32 1)"
+
+	helm upgrade --install neutron ./neutron \
+		--namespace=openstack \
+			--timeout 120m \
+			-f /opt/genestack/helm-configs/neutron/neutron-helm-overrides.yaml \
+			--set endpoints.identity.auth.admin.password="$(kubectl --namespace openstack get secret keystone-admin -o jsonpath='{.data.password}' | base64 -d)" \
+			--set endpoints.identity.auth.neutron.password="$(kubectl --namespace openstack get secret neutron-admin -o jsonpath='{.data.password}' | base64 -d)" \
+			--set endpoints.identity.auth.nova.password="$(kubectl --namespace openstack get secret nova-admin -o jsonpath='{.data.password}' | base64 -d)" \
+			--set endpoints.identity.auth.placement.password="$(kubectl --namespace openstack get secret placement-admin -o jsonpath='{.data.password}' | base64 -d)" \
+			--set endpoints.identity.auth.designate.password="$(kubectl --namespace openstack get secret designate-admin -o jsonpath='{.data.password}' | base64 -d)" \
+			--set endpoints.identity.auth.ironic.password="$(kubectl --namespace openstack get secret ironic-admin -o jsonpath='{.data.password}' | base64 -d)" \
+			--set endpoints.oslo_db.auth.admin.password="$(kubectl --namespace openstack get secret mariadb -o jsonpath='{.data.root-password}' | base64 -d)" \
+			--set endpoints.oslo_db.auth.neutron.password="$(kubectl --namespace openstack get secret neutron-db-password -o jsonpath='{.data.password}' | base64 -d)" \
+			--set endpoints.oslo_messaging.auth.admin.password="$(kubectl --namespace openstack get secret rabbitmq-default-user -o jsonpath='{.data.password}' | base64 -d)" \
+			--set endpoints.oslo_messaging.auth.neutron.password="$(kubectl --namespace openstack get secret neutron-rabbitmq-password -o jsonpath='{.data.password}' | base64 -d)" \
+			--set conf.neutron.ovn.ovn_nb_connection="tcp:$(kubectl --namespace kube-system get service ovn-nb -o jsonpath='{.spec.clusterIP}:{.spec.ports[0].port}')" \
+			--set conf.neutron.ovn.ovn_sb_connection="tcp:$(kubectl --namespace kube-system get service ovn-sb -o jsonpath='{.spec.clusterIP}:{.spec.ports[0].port}')" \
+			--set conf.plugins.ml2_conf.ovn.ovn_nb_connection="tcp:$(kubectl --namespace kube-system get service ovn-nb -o jsonpath='{.spec.clusterIP}:{.spec.ports[0].port}')" \
+			--set conf.plugins.ml2_conf.ovn.ovn_sb_connection="tcp:$(kubectl --namespace kube-system get service ovn-sb -o jsonpath='{.spec.clusterIP}:{.spec.ports[0].port}')" \
+			--post-renderer /opt/genestack/kustomize/kustomize.sh \
+			--post-renderer-args neutron/base
+
+	kubectl --namespace openstack exec -ti openstack-admin-client -- openstack network agent list
+}
+
+install_nova () {
+	kubectl --namespace openstack \
+					create secret generic placement-db-password \
+					--type Opaque \
+					--from-literal=password="$(pwgen -s 32 1)"
+	kubectl --namespace openstack \
+					create secret generic placement-admin \
+					--type Opaque \
+					--from-literal=password="$(pwgen -s 32 1)"
+
+	kubectl --namespace openstack \
+					create secret generic nova-db-password \
+					--type Opaque \
+					--from-literal=password="$(pwgen -s 32 1)"
+	kubectl --namespace openstack \
+					create secret generic nova-admin \
+					--type Opaque \
+					--from-literal=password="$(pwgen -s 32 1)"
+	kubectl --namespace openstack \
+					create secret generic nova-rabbitmq-password \
+					--type Opaque \
+					--from-literal=username="nova" \
+					--from-literal=password="$(pwgen -s 32 1)"
+
+	helm upgrade --install placement ./placement --namespace=openstack \
+		--namespace=openstack \
+			--timeout 120m \
+			-f /opt/genestack/helm-configs/placement/placement-helm-overrides.yaml \
+			--set endpoints.identity.auth.admin.password="$(kubectl --namespace openstack get secret keystone-admin -o jsonpath='{.data.password}' | base64 -d)" \
+			--set endpoints.identity.auth.placement.password="$(kubectl --namespace openstack get secret placement-admin -o jsonpath='{.data.password}' | base64 -d)" \
+			--set endpoints.oslo_db.auth.admin.password="$(kubectl --namespace openstack get secret mariadb -o jsonpath='{.data.root-password}' | base64 -d)" \
+			--set endpoints.oslo_db.auth.placement.password="$(kubectl --namespace openstack get secret placement-db-password -o jsonpath='{.data.password}' | base64 -d)" \
+			--set endpoints.oslo_db.auth.nova_api.password="$(kubectl --namespace openstack get secret nova-db-password -o jsonpath='{.data.password}' | base64 -d)" \
+			--post-renderer /opt/genestack/kustomize/kustomize.sh \
+			--post-renderer-args placement/base
+	helm upgrade --install nova ./nova \
+		--namespace=openstack \
+			--timeout 120m \
+			-f /opt/genestack/helm-configs/nova/nova-helm-overrides.yaml \
+			--set endpoints.identity.auth.admin.password="$(kubectl --namespace openstack get secret keystone-admin -o jsonpath='{.data.password}' | base64 -d)" \
+			--set endpoints.identity.auth.nova.password="$(kubectl --namespace openstack get secret nova-admin -o jsonpath='{.data.password}' | base64 -d)" \
+			--set endpoints.identity.auth.neutron.password="$(kubectl --namespace openstack get secret neutron-admin -o jsonpath='{.data.password}' | base64 -d)" \
+			--set endpoints.identity.auth.ironic.password="$(kubectl --namespace openstack get secret ironic-admin -o jsonpath='{.data.password}' | base64 -d)" \
+			--set endpoints.identity.auth.placement.password="$(kubectl --namespace openstack get secret placement-admin -o jsonpath='{.data.password}' | base64 -d)" \
+			--set endpoints.identity.auth.cinder.password="$(kubectl --namespace openstack get secret cinder-admin -o jsonpath='{.data.password}' | base64 -d)" \
+			--set endpoints.oslo_db.auth.admin.password="$(kubectl --namespace openstack get secret mariadb -o jsonpath='{.data.root-password}' | base64 -d)" \
+			--set endpoints.oslo_db.auth.nova.password="$(kubectl --namespace openstack get secret nova-db-password -o jsonpath='{.data.password}' | base64 -d)" \
+			--set endpoints.oslo_db_api.auth.admin.password="$(kubectl --namespace openstack get secret mariadb -o jsonpath='{.data.root-password}' | base64 -d)" \
+			--set endpoints.oslo_db_api.auth.nova.password="$(kubectl --namespace openstack get secret nova-db-password -o jsonpath='{.data.password}' | base64 -d)" \
+			--set endpoints.oslo_db_cell0.auth.admin.password="$(kubectl --namespace openstack get secret mariadb -o jsonpath='{.data.root-password}' | base64 -d)" \
+			--set endpoints.oslo_db_cell0.auth.nova.password="$(kubectl --namespace openstack get secret nova-db-password -o jsonpath='{.data.password}' | base64 -d)" \
+			--set endpoints.oslo_messaging.auth.admin.password="$(kubectl --namespace openstack get secret rabbitmq-default-user -o jsonpath='{.data.password}' | base64 -d)" \
+			--set endpoints.oslo_messaging.auth.nova.password="$(kubectl --namespace openstack get secret nova-rabbitmq-password -o jsonpath='{.data.password}' | base64 -d)" \
+			--post-renderer /opt/genestack/kustomize/kustomize.sh \
+			--post-renderer-args nova/base
+
+	kubectl --namespace openstack exec -ti openstack-admin-client -- openstack compute service list
+}
+
+install_horizon () {
+	kubectl --namespace openstack \
+					create secret generic horizon-secrete-key \
+					--type Opaque \
+					--from-literal=username="horizon" \
+					--from-literal=password="$(pwgen -s 64 1)"
+	kubectl --namespace openstack \
+					create secret generic horizon-db-password \
+					--type Opaque \
+					--from-literal=password="$(pwgen -s 32 1)"
+
+	helm upgrade --install horizon ./horizon \
+			--namespace=openstack \
+			--wait \
+			--timeout 120m \
+			-f /opt/genestack/helm-configs/horizon/horizon-helm-overrides.yaml \
+			--set endpoints.identity.auth.admin.password="$(kubectl --namespace openstack get secret keystone-admin -o jsonpath='{.data.password}' | base64 -d)" \
+			--set conf.horizon.local_settings.config.horizon_secret_key="$(kubectl --namespace openstack get secret horizon-secrete-key -o jsonpath='{.data.root-password}' | base64 -d)" \
+			--set endpoints.oslo_db.auth.admin.password="$(kubectl --namespace openstack get secret mariadb -o jsonpath='{.data.root-password}' | base64 -d)" \
+			--set endpoints.oslo_db.auth.horizon.password="$(kubectl --namespace openstack get secret horizon-db-password -o jsonpath='{.data.password}' | base64 -d)" \
+			--post-renderer /opt/genestack/kustomize/kustomize.sh \
+			--post-renderer-args horizon/base
+}
+
+install_skyline () {
+	kubectl --namespace openstack \
+					create secret generic skyline-apiserver-secrets \
+					--type Opaque \
+					--from-literal=service-username="skyline" \
+					--from-literal=service-password="$(pwgen -s 32 1)" \
+					--from-literal=service-domain="service" \
+					--from-literal=service-project="service" \
+					--from-literal=service-project-domain="service" \
+					--from-literal=db-endpoint="mariadb-galera-primary.openstack.svc.${CLUSTER_NAME}" \
+					--from-literal=db-name="skyline" \
+					--from-literal=db-username="skyline" \
+					--from-literal=db-password="$(pwgen -s 32 1)" \
+					--from-literal=secret-key="$(pwgen -s 32 1)" \
+					--from-literal=keystone-endpoint="http://keystone-api.openstack.svc.cluster.local:5000" \
+					--from-literal=default-region="RegionOne"
+
+	kubectl --namespace openstack apply -k /opt/genestack/kustomize/skyline/base
 }
 
 install_openstack () {
@@ -924,6 +1127,10 @@ install_openstack () {
   wrap_func install_keystone
   wrap_func install_glance
   wrap_func install_cinder
+  wrap_func install_neutron
+  wrap_func install_nova
+  #wrap_func install_horizon
+  wrap_func install_skyline
 }
 
 
@@ -949,6 +1156,7 @@ wrap_func get_genestack
 wrap_func make_genestack
 wrap_func prepare_vms
 wrap_func spray_kube
+wrap_func steal_kube_conf
 wrap_func label_nodes
 wrap_func prepare_kube
 wrap_func install_openstack
