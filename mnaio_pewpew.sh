@@ -14,6 +14,8 @@ STORAGE_DEVICES="/dev/sdc /dev/sdd"
 
 CLUSTER_NAME="lab.local"
 
+VM_SAVE_DIR="/var/lib/pewpew"
+
 export CONTAINER_DISTRO_NAME=ubuntu
 export CONTAINER_DISTRO_VERSION=jammy
 export OPENSTACK_RELEASE=2023.1
@@ -50,9 +52,11 @@ VM_ROOT_DISK["storage"]=20
 VM_ROOT_DISK["network"]=20
 
 declare -A VM_EXTRA_DISKS
+VM_EXTRA_DISKS["utility"]=2
 VM_EXTRA_DISKS["storage"]=4
 
 declare -A VM_EXTRA_DISKS_SIZE
+VM_EXTRA_DISKS_SIZE["utility"]="20"
 VM_EXTRA_DISKS_SIZE["storage"]="50"
 
 # Take these devices on the storage nodes for the cinder VG
@@ -68,26 +72,32 @@ VM_EXTRA_DISKS_RAID=0
 MGMT_BRIDGE="br-mgmt"
 MGMT_IP_PREFIX="192.168.100"
 MGMT_MAC_PREFIX="de:ad:be:ef:00"
+HOST_MGMT_IP="${MGMT_IP_PREFIX}.1"
 
 KUBE_BRIDGE="br-kube"
 KUBE_IP_PREFIX="192.168.120"
 KUBE_MAC_PREFIX="de:ad:be:ef:11"
+HOST_KUBE_IP="${KUBE_IP_PREFIX}.1"
 
 BREX_BRIDGE="br-ex"
 # br-ex IPs go to neutron not the vms but we still need the space reserved
 BREX_IP_PREFIX="192.168.140" 
 BREX_MAC_PREFIX="de:ad:be:ef:22"
+HOST_BREX_IP="${BREX_IP_PREFIX}.1"
 
 STOR_BRIDGE="br-storage"
 STOR_IP_PREFIX="192.168.160"
 STOR_MAC_PREFIX="de:ad:be:ef:33"
+# we don't give the host a storage ip but if we did this would be it
+HOST_STOR_IP="${STOR_IP_PREFIX}.1"
+
+REGISTRY_RELEASE="https://github.com/distribution/distribution/releases/download/v2.8.3/registry_2.8.3_linux_amd64.tar.gz"
 
 IPTABLES_V4_CONF="/etc/iptables/rules.v4"
 IPTABLES_V6_CONF="/etc/iptables/rules.v6"
 
 LOG_FILE="/root/pewpew.log"
 
-TEMP_INVENTORY="$(mktemp)"
 INVENTORY="/opt/genestack/inventory.ini"
 
 # these get filled in later
@@ -230,15 +240,10 @@ setup_host () {
     ssh-keygen -f /root/.ssh/id_rsa -P ""
   fi
 
-  DEBIAN_FRONTEND=noninteractive apt-get -y install libvirt-daemon-system virtinst jq make python3-venv bridge-utils genisoimage pv pwgen iptables-persistent
+  DEBIAN_FRONTEND=noninteractive apt-get -y install libvirt-daemon-system virtinst jq make python3-venv bridge-utils genisoimage pv pwgen iptables-persistent pigz
 
 
   #### networking ####
-
-  HOST_MGMT_IP="${MGMT_IP_PREFIX}.1"
-  HOST_KUBE_IP="${KUBE_IP_PREFIX}.1"
-  HOST_BREX_IP="${BREX_IP_PREFIX}.1"
-  HOST_STOR_IP="${STOR_IP_PREFIX}.1"
 
   MGMT_NET="${MGMT_IP_PREFIX}.0/24"
   KUBE_NET="${KUBE_IP_PREFIX}.0/24"
@@ -386,6 +391,8 @@ make_vms () {
   mkdir -p /var/lib/libvirt/qemu/cloud-init
   chown libvirt-qemu:kvm /var/lib/libvirt/qemu/cloud-init
 
+  mkdir -p ${VM_SAVE_DIR}
+
   for VM_TYPE in ${VM_TYPES} ; do
     for SEQ in $( seq 1 ${NUM_VMS[${VM_TYPE}]}) ; do
       NAME="${VM_TYPE}${SEQ}"
@@ -471,13 +478,21 @@ EOF
       EXTRA_DISKS=""
       if [[ ! -z ${VM_EXTRA_DISKS[${VM_TYPE}]-} ]] ; then
         for EXTRA_DISK in $( seq 1 ${VM_EXTRA_DISKS[${VM_TYPE}]} ) ; do
-          lvcreate --type raid${VM_EXTRA_DISKS_RAID} -L "${VM_EXTRA_DISKS_SIZE[${VM_TYPE}]}G" --nosync -n "lv_${NAME}_${EXTRA_DISK}" vg_libvirt
+          lvcreate --type raid${VM_EXTRA_DISKS_RAID} --size "${VM_EXTRA_DISKS_SIZE[${VM_TYPE}]}G" --stripesize 4K --nosync -n "lv_${NAME}_${EXTRA_DISK}" vg_libvirt
           EXTRA_DISKS="${EXTRA_DISKS} --disk path=/dev/vg_libvirt/lv_${NAME}_${EXTRA_DISK},bus=virtio,sparse=false,format=raw"
+          if [[ -f "${VM_SAVE_DIR}/lv_${NAME}_${EXTRA_DISK}.gz" ]] ; then
+            echo "Restoring lv_${NAME}_${EXTRA_DISK} ..."
+            pigz -cd "${VM_SAVE_DIR}/lv_${NAME}_${EXTRA_DISK}.gz" | pv -B 16M > /dev/vg_libvirt/lv_${NAME}_${EXTRA_DISK}
+          fi
         done
       fi
 
-      lvcreate --type raid${VM_ROOT_DISKS_RAID} -L "${VM_ROOT_DISK["${VM_TYPE}"]}G" --nosync -n "lv_${NAME}" vg_libvirt
-      dd if=/root/jammy-server-cloudimg-amd64.raw bs=16M of="/dev/vg_libvirt/lv_${NAME}"
+      lvcreate --type raid${VM_ROOT_DISKS_RAID} --size "${VM_ROOT_DISK["${VM_TYPE}"]}G" --stripesize 4K --nosync -n "lv_${NAME}" vg_libvirt
+      if [[ -f "${VM_SAVE_DIR}/${NAME}.gz" ]] ; then
+        zcat "${VM_SAVE_DIR}/${NAME}.gz" | dd if=- bs=16M of="/dev/vg_libvirt/lv_${NAME}"
+      else
+        dd if=/root/jammy-server-cloudimg-amd64.raw bs=16M of="/dev/vg_libvirt/lv_${NAME}"
+      fi
 
       virt-install \
         --name="${NAME}" \
@@ -516,6 +531,8 @@ wait_for_vms () {
 }
 
 make_inventory () {
+  TEMP_INVENTORY="$(mktemp)"
+  UTIL_VM_IP="${MGMT_IP_PREFIX}.10"
   echo "[all]" > ${TEMP_INVENTORY}
 
   for NAME in ${LIST_OF_VMS} ; do
@@ -529,20 +546,22 @@ make_inventory () {
 [all:vars]
 ansible_ssh_common_args='-o StrictHostKeyChecking=accept-new'
 cluster_name=${CLUSTER_NAME}
-# note: for ansible reasons True is a bool and true is a string
-kubectl_localhost=True
-kubeconfig_localhost=True
-download_run_once=True
-upstream_dns_servers=["69.20.0.164","1.1.1.1"]
-# deps
-kube_network_plugin=kube-ovn
-cert_manager_enabled=True
-kube_proxy_strict_arp=True
-metallb_enabled=True
 EOF
 
   echo "[bastion]" >> ${TEMP_INVENTORY}
   WANT_TYPES="bastion"
+  for VM_TYPE in ${WANT_TYPES} ; do
+    if [[ ! -z ${NUM_VMS[${VM_TYPE}]-} ]] ; then
+      for SEQ in $( seq 1 ${NUM_VMS[${VM_TYPE}]}) ; do
+        NAME="${VM_TYPE}${SEQ}"
+        FQDN="${NAME}.${CLUSTER_NAME}"
+        echo "${FQDN}" >> ${TEMP_INVENTORY}
+      done
+    fi
+  done
+
+  echo "[util]" >> ${TEMP_INVENTORY}
+  WANT_TYPES="utility"
   for VM_TYPE in ${WANT_TYPES} ; do
     if [[ ! -z ${NUM_VMS[${VM_TYPE}]-} ]] ; then
       for SEQ in $( seq 1 ${NUM_VMS[${VM_TYPE}]}) ; do
@@ -621,11 +640,6 @@ get_genestack () {
   ~/.venvs/kubespray/bin/pip install pip  --upgrade
   source ~/.venvs/kubespray/bin/activate
   pip install -r /opt/genestack/submodules/kubespray/requirements.txt
-  cd /opt/genestack/submodules/kubespray/inventory
-
-  # copy inventory to final location
-  cp ${TEMP_INVENTORY} ${INVENTORY}
-  rm ${TEMP_INVENTORY}
 
   # get helm if not already installed
   if [[ -z "$(which helm)" ]] ; then
@@ -639,6 +653,54 @@ make_genestack () {
 
   cd /opt/genestack/submodules/openstack-helm-infra
   make all
+
+  # copy inventory to final location
+  cp ${TEMP_INVENTORY} ${INVENTORY}
+  rm ${TEMP_INVENTORY}
+
+  # add some vars
+  UTIL_VM_IP="${MGMT_IP_PREFIX}.10"
+  mkdir -p /opt/genestack/group_vars/all
+  cat > /opt/genestack/group_vars/all/all.yml <<EOF
+kubectl_localhost: true
+kubeconfig_localhost: true
+unsafe_show_logs: true
+upstream_dns_servers:
+  - 69.20.0.164
+  - 1.1.1.1
+kube_network_plugin: kube-ovn
+cert_manager_enabled: true
+kube_proxy_strict_arp: true
+metallb_enabled: true
+metrics_server_enabled: true
+# proxy stuff
+download_run_once: false
+image_command_tool: crictl
+containerd_registries_mirrors:
+  - prefix: docker.io
+    mirrors:
+      - host: http://${UTIL_VM_IP}:5001
+        capabilities: ["pull", "resolve"]
+        skip_verify: true
+  - prefix: ghcr.io
+    mirrors:
+      - host: http://${UTIL_VM_IP}:5002
+        capabilities: ["pull", "resolve"]
+        skip_verify: true
+  - prefix: quay.io
+    mirrors:
+      - host: http://${UTIL_VM_IP}:5003
+        capabilities: ["pull", "resolve"]
+        skip_verify: true
+  - prefix: registry.k8s.io
+    mirrors:
+      - host: http://${UTIL_VM_IP}:5004
+        capabilities: ["pull", "resolve"]
+        skip_verify: true
+http_proxy: http://${UTIL_VM_IP}:3128
+#https_proxy: http://${UTIL_VM_IP}:3128
+additional_no_proxy: ${UTIL_VM_IP}
+EOF
 
   # override default cluster name
   set +f
@@ -657,6 +719,155 @@ prepare_vms () {
   # add cinder pvs to vg
   ansible -m shell -a "pvcreate ${CINDER_LVM_PVS}" -i ${INVENTORY} cinder_storage_nodes
   ansible -m shell -a "vgcreate cinder-volumes-1 ${CINDER_LVM_PVS}" -i ${INVENTORY} cinder_storage_nodes
+}
+
+setup_proxy () {
+  source ~/.venvs/kubespray/bin/activate
+  # be lazy
+  #ansible -m shell -a 'cp /home/ubuntu/.ssh/authorized_keys /root/.ssh/authorized_keys' -i ${INVENTORY} util
+  #PROXY_SETUP_SCRIPT=$(mktemp)
+  PROXY_SETUP_SCRIPT=/tmp/proxy-setup-script
+
+  cat > ${PROXY_SETUP_SCRIPT}  <<EOF
+#!/bin/bash
+set +euf
+set -o pipefail
+if [[ ! \$(pvs /dev/vdb) ]] ; then pvcreate /dev/vdb; fi
+if [[ ! \$(pvs /dev/vdc) ]] ; then pvcreate /dev/vdb; fi
+if [[ ! \$(vgs vg_squid) ]] ; then vgcreate vg_squid /dev/vdb ; fi
+if [[ ! \$(vgs vg_registry) ]] ; then vgcreate vg_registry /dev/vdc ; fi
+if [[ ! \$(lvs vg_squid/lv_squid) ]] ; then lvcreate -l100%FREE -n lv_squid vg_squid ; fi
+if [[ ! \$(lvs vg_registry/lv_registry) ]] ; then lvcreate -l100%FREE -n lv_registry vg_registry ; fi
+if [[ ! "\$(blkid /dev/vg_squid/lv_squid)" =~ 'TYPE="ext4"' ]] ; then mkfs.ext4 /dev/vg_squid/lv_squid  ; fi
+if [[ ! "\$(blkid /dev/vg_registry/lv_registry)" =~ 'TYPE="ext4"' ]] ; then mkfs.ext4 /dev/vg_registry/lv_registry  ; fi
+mkdir -p /var/lib/squid
+mkdir -p /var/lib/registry
+mkdir -p /etc/registry
+echo "/dev/vg_squid/lv_squid       /var/lib/squid    ext4 defaults,discard,noatime 0 1" >> /etc/fstab
+echo "/dev/vg_registry/lv_registry /var/lib/registry ext4 defaults,discard,noatime 0 1" >> /etc/fstab
+mount -a
+chown proxy:proxy /var/lib/squid /var/lib/registry /etc/registry
+DEBIAN_FRONTEND=noninteractive apt-get -y -qq update
+DEBIAN_FRONTEND=noninteractive RUNLEVEL=1 apt-get -y -qq install squid
+if [[ ! -f /etc/squid/conf.d/pewpew.conf ]] ; then
+  echo http_access allow localnet >> /etc/squid/conf.d/pewpew.conf
+  echo cache_dir ufs /var/lib/squid $(( ${VM_EXTRA_DISKS_SIZE["utility"]} * 1024 * 80 )) 16 256 >> /etc/squid/conf.d/pewpew.conf
+  systemctl restart squid
+fi
+cd /root/
+wget ${REGISTRY_RELEASE}
+tar xvzf $(basename ${REGISTRY_RELEASE})
+cp ./registry /usr/local/bin/registry
+cat > /etc/registry/default.yml << EOL
+version: 0.1
+log:
+  fields:
+    service: registry
+storage:
+  cache:
+    blobdescriptor: inmemory
+  filesystem:
+    rootdirectory: /var/lib/registry
+  maintenance:
+    uploadpurging:
+      enabled: true
+      age: 730h
+      interval: 168h
+      dryrun: true
+http:
+  addr: :5000
+  headers:
+    X-Content-Type-Options: [nosniff]
+health:
+  storagedriver:
+    enabled: true
+    interval: 10s
+    threshold: 3
+EOL
+
+cat > /etc/systemd/system/docker-registry.service << EOL
+[Unit]
+Description=Pull-through registry for docker
+After=network.target
+[Service]
+Type=simple
+Restart=always
+User=proxy
+Environment=REGISTRY_HTTP_ADDR=:5001
+Environment=REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY=/var/lib/registry/docker
+Environment=REGISTRY_PROXY_REMOTEURL=https://registry-1.docker.io
+ExecStart=/usr/local/bin/registry serve /etc/registry/default.yml
+[Install]
+WantedBy=multi-user.target
+EOL
+
+cat > /etc/systemd/system/github-registry.service << EOL
+[Unit]
+Description=Pull-through registry for github
+After=network.target
+[Service]
+Type=simple
+Restart=always
+User=proxy
+Environment=REGISTRY_HTTP_ADDR=:5002
+Environment=REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY=/var/lib/registry/github
+Environment=REGISTRY_PROXY_REMOTEURL=https://ghcr.io
+Environment=REGISTRY_STORAGE_MAINTENANCE_UPLOADPURGING_ENABLED=false
+ExecStart=/usr/local/bin/registry serve /etc/registry/default.yml
+[Install]
+WantedBy=multi-user.target
+EOL
+
+cat > /etc/systemd/system/quay-registry.service << EOL
+[Unit]
+Description=Pull-through registry for quay
+After=network.target
+[Service]
+Type=simple
+Restart=always
+User=proxy
+Environment=REGISTRY_HTTP_ADDR=:5003
+Environment=REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY=/var/lib/registry/quay
+Environment=REGISTRY_PROXY_REMOTEURL=https://quay.io/repository
+Environment=REGISTRY_STORAGE_MAINTENANCE_UPLOADPURGING_ENABLED=false
+ExecStart=/usr/local/bin/registry serve /etc/registry/default.yml
+[Install]
+WantedBy=multi-user.target
+EOL
+
+cat > /etc/systemd/system/k8s-registry.service << EOL
+[Unit]
+Description=Pull-through registry for k8s
+After=network.target
+[Service]
+Type=simple
+Restart=always
+User=proxy
+Environment=REGISTRY_HTTP_ADDR=:5004
+Environment=REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY=/var/lib/registry/k8s
+Environment=REGISTRY_PROXY_REMOTEURL=https://registry.k8s.io
+Environment=REGISTRY_STORAGE_MAINTENANCE_UPLOADPURGING_ENABLED=false
+ExecStart=/usr/local/bin/registry serve /etc/registry/default.yml
+[Install]
+WantedBy=multi-user.target
+EOL
+
+systemctl daemon-reload
+systemctl enable --now docker-registry.service
+systemctl enable --now github-registry.service
+systemctl enable --now quay-registry.service
+systemctl enable --now k8s-registry.service
+
+EOF
+
+  ansible -m script -a "${PROXY_SETUP_SCRIPT}" -i ${INVENTORY} util
+
+  # tell apt about proxy
+  APT_PROXY_CONF=$(mktemp)
+  UTIL_VM_IP="${MGMT_IP_PREFIX}.10"
+  echo "Acquire::http::Proxy \"http://${UTIL_VM_IP}:3128\";" > "${APT_PROXY_CONF}"
+  ansible -m copy -a "src=${APT_PROXY_CONF} dest=/etc/apt/apt.conf.d/60-proxy" -i ${INVENTORY} all
+  rm "${APT_PROXY_CONF}"
 }
 
 spray_kube () {
@@ -1116,7 +1327,7 @@ install_skyline () {
 					--from-literal=db-username="skyline" \
 					--from-literal=db-password="$(pwgen -s 32 1)" \
 					--from-literal=secret-key="$(pwgen -s 32 1)" \
-					--from-literal=keystone-endpoint="http://keystone-api.openstack.svc.cluster.local:5000" \
+					--from-literal=keystone-endpoint="http://keystone-api.openstack.svc.${CLUSTER_NAME}:5000" \
 					--from-literal=default-region="RegionOne"
 
 	kubectl --namespace openstack apply -k /opt/genestack/kustomize/skyline/base
@@ -1155,6 +1366,7 @@ wrap_func make_inventory
 wrap_func get_genestack
 wrap_func make_genestack
 wrap_func prepare_vms
+wrap_func setup_proxy
 wrap_func spray_kube
 wrap_func steal_kube_conf
 wrap_func label_nodes
