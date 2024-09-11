@@ -191,7 +191,9 @@ remove_service () {
 }
 
 force_tmux () {
+  set +e
   if [[ ! -n ${TMUX} ]] ; then
+    set -e
     echo not tmuxin
     tmux new-session -s mnaio_pewpew -d
     tmux send-keys -t mnaio_pewpew C-c
@@ -201,6 +203,7 @@ force_tmux () {
   else
     echo tmuxin
   fi
+set -e
 }
 
 setup_host () {
