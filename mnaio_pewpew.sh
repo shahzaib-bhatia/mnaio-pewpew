@@ -132,6 +132,9 @@ wrap_func () {
 reboot_and_rerun () {
   chmod +x $(realpath $0)
   cat > /etc/systemd/system/mnaio_pewpew.service <<EOF
+[Unit]
+Description=Continue mnaio installation
+After=default.target
 [Service]
 ExecStart=$(realpath $0)
 Type=oneshot
