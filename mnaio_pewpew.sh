@@ -494,7 +494,7 @@ EOF
       if [[ -f "${VM_SAVE_DIR}/${NAME}.gz" ]] ; then
         zcat "${VM_SAVE_DIR}/${NAME}.gz" | dd if=- bs=16M of="/dev/vg_libvirt/lv_${NAME}"
       else
-        dd if=/root/jammy-server-cloudimg-amd64.raw bs=16M of="/dev/vg_libvirt/lv_${NAME}"
+        dd if=/tmp/jammy-server-cloudimg-amd64.raw bs=16M of="/dev/vg_libvirt/lv_${NAME}"
       fi
 
       virt-install \
