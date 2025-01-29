@@ -98,7 +98,7 @@ IPTABLES_V6_CONF="/etc/iptables/rules.v6"
 
 LOG_FILE="/root/pewpew.log"
 
-INVENTORY="/opt/genestack/inventory.ini"
+INVENTORY="/opt/genestack/ansible/inventory/genestack/inventory.ini"
 
 # these get filled in later
 LIST_OF_VMS=""
@@ -633,7 +633,7 @@ EOF
 
 get_genestack () {
   if [[ ! -d "/opt/genestack" ]] ; then
-    git clone --recurse-submodules -j4 https://github.com/cloudnull/genestack /opt/genestack
+    git clone --recurse-submodules -j4 https://github.com/rackerlabs/genestack /opt/genestack
   fi
 
   # kubespray venv
@@ -706,9 +706,10 @@ additional_no_proxy: ${UTIL_VM_IP}
 EOF
 
   # override default cluster name
-  set +f
-  sed -i "s/cluster_domain_suffix: cluster.local/cluster_domain_suffix: ${CLUSTER_NAME}/" /opt/genestack/helm-configs/*/*.yaml
-  set -f
+  # fixed by https://github.com/rackerlabs/genestack/pull/70
+  # set +f
+  # sed -i "s/cluster_domain_suffix: cluster.local/cluster_domain_suffix: ${CLUSTER_NAME}/" /opt/genestack/helm-configs/*/*.yaml
+  # set -f
 }
 
 prepare_vms () {
